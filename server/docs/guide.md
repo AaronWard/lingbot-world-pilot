@@ -1,3 +1,430 @@
+
+Got it. I’ll treat this as a **code review + “what to fix next”** pass, assuming the goal is: **your React app becomes a real client** for this FastAPI backend, streaming frames + sending WASD/mouse input with low-feel latency.
+
+## 1) Code understanding (what you have now)
+
+### Backend (server/main.py)
+
+You’ve implemented the right overall shape:
+
+* **POST `/api/session`**
+  Accepts `prompt`, `resolution`, `quality`, optional `initImage`, creates `SessionState`, returns `session_id` + `ws_url`.
+
+* **WS `/ws/session/{session_id}`** (duplex)
+
+  * Background `generator_loop()` produces **short chunks** (default 9 frames @ 16fps target) using:
+
+    * rolling `init_img` = **last generated frame** (1-frame continuation)
+    * `poses.npy` + `intrinsics.npy` written into a per-session work directory
+    * `pipeline.generate(prompt, init_img, action_path, max_area, frame_num, steps, guide, seed)`
+  * Enqueues each frame as **JPEG bytes** + JSON header into `frame_queue`
+  * Sends:
+
+    * **binary frames**: `[4-byte header_len][header_json][jpeg_bytes]`
+    * **telemetry**: JSON text messages periodically
+
+* You’ve got **backpressure + dropping**: queue maxsize, drop oldest if full, low/high watermarks.
+
+### Frontend (current state)
+
+Frontend is still a **mock renderer** (grid + fake latency), but it already has:
+
+* input capture (WASD/mouse, pointer lock)
+* telemetry HUD plumbing
+* the conceptual loop structure that we’ll replace with:
+
+  * create session via HTTP
+  * connect WS
+  * send input messages
+  * receive binary frames + telemetry
+
+So the overall architecture matches what you want.
+
+---
+
+## 2) Spec + plan of attack (what must be true before we write any JS)
+
+### 2.1 Wire protocol: lock it down
+
+You’re already close. I’d formalize these as the “contract”:
+
+#### HTTP: create session
+
+`POST /api/session` with `multipart/form-data`
+
+Fields:
+
+* `prompt: string` (required)
+* `resolution: "480p" | "720p"` (default "480p")
+* `quality: "latency" | "balanced" | "quality"` (default "balanced")
+* `initImage: file?` (optional)
+
+Response (JSON):
+
+```json
+{
+  "session_id": "uuid",
+  "ws_url": "ws://HOST:8000/ws/session/uuid",
+  "resolution": "480p",
+  "quality": "balanced"
+}
+```
+
+#### WebSocket: client → server input
+
+Text JSON:
+
+```json
+{
+  "type": "input",
+  "seq": 123,
+  "client_ts_ms": 1700000000000,
+  "state": { "w":true, "a":false, "s":false, "d":false, "space":false, "mouseX":3.2, "mouseY":-1.1 }
+}
+```
+
+#### WebSocket: server → client telemetry
+
+Text JSON:
+
+```json
+{
+  "type": "telemetry",
+  "server_ts_ms": 1700000000123,
+  "fps": 14.7,
+  "bufferMs": 820,
+  "latencyMs": 210,
+  "generationTimeMs": 610
+}
+```
+
+#### WebSocket: server → client frame
+
+Binary:
+
+```
+u32_le header_len
+header JSON bytes
+jpeg bytes
+```
+
+Header JSON **should include enough info for real latency accounting**:
+
+```json
+{
+  "type": "frame",
+  "session_id": "...",
+  "frame_id": 42,
+  "w": 832,
+  "h": 480,
+  "format": "jpeg",
+  "server_ts_ms": 1700000000456,
+
+  "input_seq": 123,
+  "input_client_ts_ms": 1700000000000,
+  "chunk_id": 7,
+  "chunk_frame_idx": 3
+}
+```
+
+> Right now you don’t include `input_seq` / `chunk_id` / `chunk_frame_idx`, so you can’t measure true “input → displayed frame” latency. We should add those before updating JS.
+
+---
+
+### 2.2 The biggest “correctness” gaps to fix in backend **now**
+
+These are the important ones, in order.
+
+#### Blocker A — repo layout / import path ambiguity
+
+`from generate_prequant import WanI2V_PreQuant` assumes `generate_prequant.py` exists in `REPO_ROOT`.
+
+But your directory listing does **not** include it, meaning one of these is true:
+
+* you copied your webapp into the NF4 repo root (fine), **or**
+* this backend will crash on import (likely)
+
+✅ Fix: make the model repo path explicit via env var:
+
+* `LINGBOT_MODEL_REPO=/path/to/lingbot-world-base-cam-nf4`
+* add that to `sys.path`
+* use that as `checkpoint_dir`
+
+This makes your webapp repo independent.
+
+#### Blocker B — “no image provided => generate first frame”
+
+Right now you create a neutral gray image. That’s **not** what you described.
+
+Reality check: **LingBot-World base-cam is i2v**. If you want true “no image,” you need a **text-to-image** step (separate model) or a baked-in initial frame generator.
+
+✅ Fix options:
+
+* **MVP**: require init image for now (UI can enforce it).
+* **Better**: integrate a small T2I (SDXL-turbo / etc.) to produce init image if missing.
+* **Hack**: generate 1–2 frames from gray and use the first as init. (Works but quality will be “random vibe.”)
+
+We should decide which you want before wiring the frontend.
+
+#### Important C — FastAPI error handling
+
+You use `raise ValueError` / `RuntimeError`. That will return 500s.
+
+✅ Fix: use `HTTPException(status_code=400/409, detail=...)`.
+
+#### Important D — ws_url is hardcoded to localhost
+
+`ws_url=f"ws://localhost:8000/..."`
+If the client is on a different device, or you access via LAN hostname, this breaks.
+
+✅ Fix: either:
+
+* return relative `"/ws/session/{id}"` and let frontend build URL, or
+* derive host from request headers (more annoying behind proxies).
+
+#### Important E — telemetry “latencyMs” isn’t meaningful yet
+
+You compute `now - latest_input_ts`. That’s not “latency,” it’s “time since last input was received”.
+
+✅ Fix: tag each frame with `input_seq`/`input_ts` used for that chunk; compute input→frame latency off that.
+
+---
+
+### 2.3 Plan of attack (tight sequence)
+
+1. **Harden backend contract** (add missing header fields, fix HTTP errors, fix ws_url, fix model repo path).
+2. Add **a quick CLI test client** (Python or Node) to prove:
+
+   * session create works
+   * websocket streams frames
+   * jpeg frames decode
+3. Only then: replace the frontend mock loop with real WS code.
+
+---
+
+## 3) Backend fixes I would do immediately (before any JS)
+
+Below are the exact changes I’d recommend (conceptually). If you want, I can paste a cleaned-up full `server/main.py` next—but this is what must change first.
+
+### 3.1 Make model repo path explicit
+
+Add at top:
+
+* `MODEL_REPO = Path(os.getenv("LINGBOT_MODEL_REPO", REPO_ROOT))`
+* import `generate_prequant` from `MODEL_REPO`
+* pass `checkpoint_dir=str(MODEL_REPO)`
+
+This eliminates brittle “must live inside NF4 repo” coupling.
+
+### 3.2 Replace exceptions with HTTPException
+
+Use:
+
+* 400 for invalid params
+* 409 for “session limit reached”
+
+### 3.3 Frame header: add chunk + input metadata
+
+In `generator_loop`:
+
+* Keep `st.latest_input_seq` and `st.latest_input_client_ts_ms` (store from InputMsg)
+* Add `chunk_id` counter
+* When producing frames, stamp:
+
+  * `input_seq`, `input_client_ts_ms`
+  * `chunk_id`, `chunk_frame_idx`
+
+### 3.4 Decide behavior when initImage is missing
+
+Pick one:
+
+* enforce init image required (clean)
+* or add T2I dependency (more complex)
+* or do “gray bootstrap” intentionally and document it
+
+Right now you’re doing bootstrap but not calling it that.
+
+---
+
+## 4) One more subtle point: “ever expanding window”
+
+Your current “continuation” is **last-frame only**:
+
+* `init_img = last frame of previous chunk`
+
+That’s a **1-frame context**, not a growing window.
+If LingBot’s continuation pathway supports video conditioning (N previous frames), you’ll want:
+
+* a ring buffer of last K frames (e.g., 16–32)
+* pass those as video context if the pipeline supports it
+
+This is the difference between:
+
+* “feels like a coherent world for longer”
+  vs
+* “drifts quickly / forgets”
+
+Before implementing, we should inspect what `WanI2V_PreQuant.generate()` supports (image-only vs video-to-video). Your current code assumes image-only, which is fine for MVP.
+
+---
+
+## What I need from you to proceed cleanly
+
+Just one thing (no personal info): **is this webapp repo actually inside the NF4 repo root**, or is it separate?
+
+* If separate: we must implement `LINGBOT_MODEL_REPO` as above (strongly recommended anyway).
+* If inside: it’ll “work” as-is but still brittle long-term.
+
+Either way, next step on my side would be: **deliver an updated backend `main.py` that locks the protocol**, and a tiny test client to validate streaming. Then we move to JS.
+
+If you say “separate repo,” I’ll assume that going forward and write the backend accordingly.
+
+
+---
+Below is a **fully explicit**, end-to-end set of steps + **full backend code** that will run on your GPU machine, with:
+
+* your app cloned into: `/home/aw/Documents/github/_homelab/`
+* models cloned into: `/home/aw/Documents/models/lingbot`
+* GPU pinned via: `CUDA_VISIBLE_DEVICES=GPU-11481043-00bd-5b3f-02e7-3138b3f915be`
+* FastAPI backend that:
+
+  * creates sessions over HTTP
+  * streams frames over WebSocket (binary JPEG packets)
+  * accepts WASD/mouse input messages
+  * tags each frame with the input sequence/timestamp used for that chunk
+
+---
+
+# Part 1 — Turn your current folder into a GitHub repo and push it (no placeholders)
+
+Run these commands **in the folder containing your project** (the folder that has `package.json` and `server/`).
+
+## 1) Install Git + GitHub CLI
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git gh
+```
+
+## 2) Login to GitHub (interactive, but no placeholders)
+
+```bash
+gh auth login
+```
+
+## 3) Set git identity automatically from your authenticated GitHub user
+
+```bash
+GITHUB_LOGIN="$(gh api user -q .login)"
+GITHUB_ID="$(gh api user -q .id)"
+
+git config --global user.name "$GITHUB_LOGIN"
+git config --global user.email "${GITHUB_ID}+${GITHUB_LOGIN}@users.noreply.github.com"
+```
+
+## 4) Initialize git + commit
+
+```bash
+git init
+git add -A
+git commit -m "Initial commit"
+```
+
+## 5) Create the GitHub repo and push (repo name chosen from your app: lingbot-world-pilot)
+
+```bash
+gh repo create lingbot-world-pilot --public --source=. --remote=origin --push
+```
+
+At this point, your code is on GitHub under your logged-in account.
+
+---
+
+# Part 2 — GPU machine setup (clone app + download models to exact paths)
+
+Everything below is run on the **separate Linux machine with the RTX 5090**.
+
+## 1) Install system dependencies
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  git git-lfs \
+  python3.10 python3.10-venv python3-pip \
+  build-essential ffmpeg
+```
+
+Enable git-lfs:
+
+```bash
+git lfs install
+```
+
+## 2) Create required directories
+
+```bash
+mkdir -p /home/aw/Documents/github/_homelab
+mkdir -p /home/aw/Documents/models
+```
+
+## 3) Clone your app repo into the required folder
+
+Login to GitHub on this machine:
+
+```bash
+gh auth login
+```
+
+Clone using your authenticated account (no placeholders):
+
+```bash
+GITHUB_LOGIN="$(gh api user -q .login)"
+gh repo clone "${GITHUB_LOGIN}/lingbot-world-pilot" /home/aw/Documents/github/_homelab/lingbot-world-pilot
+```
+
+## 4) Download the NF4 model repo to the required exact path
+
+This will pull ~30GB via git-lfs:
+
+```bash
+git clone https://huggingface.co/cahlen/lingbot-world-base-cam-nf4 /home/aw/Documents/models/lingbot
+```
+
+---
+
+# Part 3 — Update backend dependencies + backend code (FULL FILES)
+
+## 3.1 Replace `server/requirements_server.txt` with this exact content
+
+On GPU machine:
+
+```bash
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+```
+
+Overwrite the file:
+
+```bash
+cat > server/requirements_server.txt << 'EOF'
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.6
+pillow==11.1.0
+numpy==1.26.4
+requests==2.32.3
+websocket-client==1.8.0
+EOF
+```
+
+> Note: I pinned `numpy==1.26.4` deliberately because many ML stacks still break on numpy 2.x.
+
+---
+
+## 3.2 Replace `server/main.py` with this exact content (FULL CODE)
+
+```bash
+cat > server/main.py << 'EOF'
 import asyncio
 import io
 import json
@@ -569,3 +996,212 @@ async def ws_session(ws: WebSocket, session_id: str) -> None:
                 shutil.rmtree(workdir, ignore_errors=True)
 
             SESSIONS.pop(session_id, None)
+EOF
+```
+
+---
+
+# Part 4 — Create Python venv + install dependencies (models + server)
+
+## 1) Create venv inside your app repo
+
+```bash
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+python3.10 -m venv .venv
+source .venv/bin/activate
+pip install -U pip wheel setuptools
+```
+
+## 2) Install model repo requirements first
+
+```bash
+pip install -r /home/aw/Documents/models/lingbot/requirements.txt
+```
+
+## 3) Install server requirements
+
+```bash
+pip install -r /home/aw/Documents/github/_homelab/lingbot-world-pilot/server/requirements_server.txt
+```
+
+---
+
+# Part 5 — Run the backend on the RTX 5090 (using your GPU UUID)
+
+## 1) Export required environment variables
+
+Run exactly:
+
+```bash
+export CUDA_VISIBLE_DEVICES=GPU-11481043-00bd-5b3f-02e7-3138b3f915be
+export LINGBOT_MODEL_REPO=/home/aw/Documents/models/lingbot
+export LINGBOT_MAX_SESSIONS=1
+export LINGBOT_TARGET_FPS=16
+export LINGBOT_CHUNK_FRAMES=9
+export LINGBOT_LOW_WATER_FRAMES=18
+export LINGBOT_HIGH_WATER_FRAMES=60
+export LINGBOT_KEEP_MODELS_ON_GPU=0
+export LINGBOT_STOP_ON_DISCONNECT=1
+export LINGBOT_CORS_ORIGINS=*
+```
+
+> If you later confirm VRAM headroom, you can switch `LINGBOT_KEEP_MODELS_ON_GPU=1` (faster, riskier for VRAM).
+
+## 2) Start the server
+
+Make sure venv is active:
+
+```bash
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+source .venv/bin/activate
+```
+
+Run:
+
+```bash
+uvicorn server.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+# Part 6 — Smoke test (guarantees server works before touching JS)
+
+## 1) Health check
+
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+```
+
+## 2) Create a test init image at /tmp/init.jpg (so no placeholders)
+
+```bash
+python3 - << 'PY'
+from PIL import Image
+img = Image.new("RGB", (832, 480), (120, 120, 120))
+img.save("/tmp/init.jpg", "JPEG", quality=95)
+print("/tmp/init.jpg written")
+PY
+```
+
+## 3) Create a session via curl (returns session_id + ws_url)
+
+```bash
+curl -s \
+  -F 'prompt=A futuristic cyberpunk city street at night, neon lights, rain on wet pavement, low angle view.' \
+  -F 'resolution=480p' \
+  -F 'quality=balanced' \
+  -F 'initImage=@/tmp/init.jpg' \
+  http://127.0.0.1:8000/api/session | python3 -m json.tool
+```
+
+## 4) Add a test client file that connects to WS and saves a few frames
+
+Create `server/test_client.py`:
+
+```bash
+cat > server/test_client.py << 'EOF'
+import json
+import struct
+import time
+import requests
+from websocket import create_connection
+
+BASE = "http://127.0.0.1:8000"
+
+def make_session():
+    files = {
+        "initImage": open("/tmp/init.jpg", "rb"),
+    }
+    data = {
+        "prompt": "A futuristic cyberpunk city street at night, neon lights, rain on wet pavement, low angle view.",
+        "resolution": "480p",
+        "quality": "balanced",
+    }
+    r = requests.post(f"{BASE}/api/session", data=data, files=files, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+def parse_frame_packet(b: bytes):
+    header_len = struct.unpack("<I", b[:4])[0]
+    header = json.loads(b[4:4+header_len].decode("utf-8"))
+    jpeg = b[4+header_len:]
+    return header, jpeg
+
+def main():
+    sess = make_session()
+    ws_url = sess["ws_url"]
+    print("WS:", ws_url)
+
+    ws = create_connection(ws_url, timeout=120)
+
+    # send a few inputs while receiving frames
+    seq = 0
+    saved = 0
+    start = time.time()
+
+    while saved < 10 and (time.time() - start) < 300:
+        # send input (walk forward)
+        msg = {
+            "type": "input",
+            "seq": seq,
+            "client_ts_ms": int(time.time() * 1000),
+            "state": {"w": True, "a": False, "s": False, "d": False, "space": False, "mouseX": 0.0, "mouseY": 0.0}
+        }
+        ws.send(json.dumps(msg))
+        seq += 1
+
+        # receive either telemetry (text) or frame (binary)
+        frame = ws.recv()
+        if isinstance(frame, str):
+            try:
+                t = json.loads(frame)
+                if t.get("type") == "telemetry":
+                    print("telemetry:", {k: t[k] for k in ["fps","bufferMs","generationTimeMs","lastInputSeq"]})
+            except Exception:
+                pass
+            continue
+
+        header, jpeg = parse_frame_packet(frame)
+        out = f"/tmp/lingbot_frame_{header['frame_id']:06d}.jpg"
+        with open(out, "wb") as f:
+            f.write(jpeg)
+        saved += 1
+        print("saved", out, "hdr:", {k: header[k] for k in ["frame_id","chunk_id","chunk_frame_idx","input_seq"]})
+
+    ws.close()
+    # stop session
+    requests.delete(f"{BASE}/api/session/{sess['session_id']}", timeout=30)
+    print("done")
+
+if __name__ == "__main__":
+    main()
+EOF
+```
+
+Run it:
+
+```bash
+source .venv/bin/activate
+python3 server/test_client.py
+```
+
+After it finishes, verify files exist:
+
+```bash
+ls -lh /tmp/lingbot_frame_*.jpg | head
+```
+
+If those JPEGs exist and look plausible, your backend is working end-to-end.
+
+---
+
+## What happens next
+
+Once you confirm the smoke test works, we’ll replace your mock loop in `WorldViewport.tsx` with:
+
+* `POST /api/session` (multipart)
+* WebSocket connect to `ws_url`
+* send `InputMsg` at ~30Hz
+* parse binary frame packets and draw JPEGs into the `<canvas>`
+
+When you’re ready, tell me **the hostname/IP** you’ll use to access the GPU machine from the browser (LAN IP is fine), and I’ll give you the updated React code wired to this backend.
