@@ -1,0 +1,8 @@
+{
+  "name": "LingBot-World Pilot",
+  "description": "Local-first web interface for piloting generative AI worlds using WASD and mouse controls.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
