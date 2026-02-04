@@ -11,6 +11,8 @@ venv
 .venv
 server/venv
 server/.venv
+server/lingbot-world-base-cam-nf4/
+
 
 node_modules
 dist
