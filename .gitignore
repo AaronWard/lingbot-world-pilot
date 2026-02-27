@@ -12,6 +12,8 @@ venv
 server/venv
 server/.venv
 server/lingbot-world-base-cam-nf4/
+*/__pycache__/
+**/__pycache__/
 
 
 node_modules

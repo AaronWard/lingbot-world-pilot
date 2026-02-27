@@ -5,7 +5,7 @@ import requests
 from websocket import create_connection
 
 BASE = "http://127.0.0.1:8000"
-
+á
 def make_session():
     files = {
         "initImage": open("/tmp/init.jpg", "rb"),

@@ -294,7 +294,7 @@ async def ensure_pipeline_loaded() -> WanI2V_PreQuant:
         if PIPELINE is None:
             PIPELINE = WanI2V_PreQuant(
                 checkpoint_dir=str(MODEL_REPO),
-                t5_cpu=True,
+                t5_cpu=False,
             )
 
             # Optional speed knob. May exceed VRAM on some setups; default is OFF.
