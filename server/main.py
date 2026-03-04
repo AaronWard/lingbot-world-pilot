@@ -295,7 +295,7 @@ async def ensure_pipeline_loaded() -> WanI2V_PreQuant:
             # DiTs + VAE go on the 5090
             dit_device_id = 1 if _torch.cuda.device_count() >= 2 else 0
             t5_device_str = "cpu"
-            vae_device_str = "cuda:0" if _torch.cuda.device_count() >= 2 else None
+            # vae_device_str = "cuda:0" if _torch.cuda.device_count() >= 2 else None
 
             logger.info("T5 on CPU, DiTs on cuda:%d", dit_device_id)
 
@@ -304,7 +304,7 @@ async def ensure_pipeline_loaded() -> WanI2V_PreQuant:
                 device_id=dit_device_id,
                 t5_cpu=True,
                 t5_device_str=t5_device_str,
-                vae_device_str=vae_device_str,
+                # vae_device_str=vae_device_str,
             )
             logger.info("WanI2V_PreQuant loaded successfully")
 
