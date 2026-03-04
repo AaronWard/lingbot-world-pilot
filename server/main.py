@@ -82,13 +82,13 @@ class CreateSessionResp(BaseModel):
 # Config
 # ============================================================
 
-QUALITY_TO_STEPS = {"latency": 8, "balanced": 16, "quality": 28}
+QUALITY_TO_STEPS = {"latency": 4, "balanced": 8, "quality": 16}
 QUALITY_TO_GUIDE = {"latency": 4.0, "balanced": 5.0, "quality": 6.0}
 
 RES_TO_HW = {"480p": (480, 832), "720p": (720, 1280)}
 
 TARGET_FPS = float(os.getenv("LINGBOT_TARGET_FPS", "16"))
-CHUNK_FRAMES = max(1, int(os.getenv("LINGBOT_CHUNK_FRAMES", "1")))  # IMPORTANT: allow 1
+CHUNK_FRAMES = max(1, int(os.getenv("LINGBOT_CHUNK_FRAMES", "9")))  # IMPORTANT: allow 1
 
 LOW_WATER_FRAMES = int(os.getenv("LINGBOT_LOW_WATER_FRAMES", "18"))
 HIGH_WATER_FRAMES = int(os.getenv("LINGBOT_HIGH_WATER_FRAMES", "60"))
@@ -240,8 +240,10 @@ def build_camera_poses(
     inp: InputStateModel,
     frames: int,
     fps: float,
-    move_m_s: float = 1.2,
-    mouse_sens: float = 0.002,
+    # move_m_s: float = 1.2,
+    move_m_s: float = 10,
+    # mouse_sens: float = 0.002,
+    mouse_sens: float = 0.02,
 ) -> Tuple[np.ndarray, CameraState]:
     dt = 1.0 / fps
     out = np.zeros((frames, 4, 4), dtype=np.float32)

@@ -354,7 +354,7 @@ export const WorldViewport: React.FC<WorldViewportProps> = ({ config, onExit }) 
         ws.close();
       }
     };
-  }, [config.wsUrl, disconnecting, drawFrame, drawPlaceholder, hasReceivedFrame]);
+  }, [config.wsUrl]);
 
   const handleDisconnect = useCallback(async () => {
     setDisconnecting(true);
