@@ -82,7 +82,7 @@ class CreateSessionResp(BaseModel):
 # Config
 # ============================================================
 
-QUALITY_TO_STEPS = {"latency": 4, "balanced": 8, "quality": 16}
+QUALITY_TO_STEPS = {"latency": 8, "balanced": 8, "quality": 16}
 QUALITY_TO_GUIDE = {"latency": 4.0, "balanced": 5.0, "quality": 6.0}
 
 RES_TO_HW = {"480p": (480, 832), "720p": (720, 1280)}
