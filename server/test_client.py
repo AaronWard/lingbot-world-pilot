@@ -1,11 +1,13 @@
 import json
 import struct
 import time
+
 import requests
 from websocket import create_connection
 
 BASE = "http://127.0.0.1:8000"
-á
+
+
 def make_session():
     files = {
         "initImage": open("/tmp/init.jpg", "rb"),
@@ -19,11 +21,13 @@ def make_session():
     r.raise_for_status()
     return r.json()
 
+
 def parse_frame_packet(b: bytes):
     header_len = struct.unpack("<I", b[:4])[0]
-    header = json.loads(b[4:4+header_len].decode("utf-8"))
-    jpeg = b[4+header_len:]
+    header = json.loads(b[4:4 + header_len].decode("utf-8"))
+    jpeg = b[4 + header_len:]
     return header, jpeg
+
 
 def main():
     sess = make_session()
@@ -32,29 +36,37 @@ def main():
 
     ws = create_connection(ws_url, timeout=120)
 
-    # send a few inputs while receiving frames
     seq = 0
     saved = 0
     start = time.time()
 
     while saved < 10 and (time.time() - start) < 300:
-        # send input (walk forward)
         msg = {
             "type": "input",
             "seq": seq,
             "client_ts_ms": int(time.time() * 1000),
-            "state": {"w": True, "a": False, "s": False, "d": False, "space": False, "mouseX": 0.0, "mouseY": 0.0}
+            "state": {
+                "w": True,
+                "a": False,
+                "s": False,
+                "d": False,
+                "space": False,
+                "mouseX": 0.0,
+                "mouseY": 0.0,
+            },
         }
         ws.send(json.dumps(msg))
         seq += 1
 
-        # receive either telemetry (text) or frame (binary)
         frame = ws.recv()
         if isinstance(frame, str):
             try:
                 t = json.loads(frame)
                 if t.get("type") == "telemetry":
-                    print("telemetry:", {k: t[k] for k in ["fps","bufferMs","generationTimeMs","lastInputSeq"]})
+                    print(
+                        "telemetry:",
+                        {k: t[k] for k in ["fps", "bufferMs", "generationTimeMs", "lastInputSeq"]},
+                    )
             except Exception:
                 pass
             continue
@@ -64,12 +76,17 @@ def main():
         with open(out, "wb") as f:
             f.write(jpeg)
         saved += 1
-        print("saved", out, "hdr:", {k: header[k] for k in ["frame_id","chunk_id","chunk_frame_idx","input_seq"]})
+        print(
+            "saved",
+            out,
+            "hdr:",
+            {k: header[k] for k in ["frame_id", "chunk_id", "chunk_frame_idx", "input_seq"]},
+        )
 
     ws.close()
-    # stop session
     requests.delete(f"{BASE}/api/session/{sess['session_id']}", timeout=30)
     print("done")
+
 
 if __name__ == "__main__":
     main()

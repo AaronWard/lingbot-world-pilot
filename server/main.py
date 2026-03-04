@@ -6,6 +6,7 @@ import sys
 import time
 import uuid
 import shutil
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -20,15 +21,16 @@ from PIL import Image
 # Paths / Imports
 # ============================================================
 
+LINGBOT_T5_CPU = os.getenv("LINGBOT_T5_CPU", "1") == "1"
+LINGBOT_PRELOAD_ON_STARTUP = os.getenv("LINGBOT_PRELOAD_ON_STARTUP", "0") == "1"
+LINGBOT_FORCE_RESOLUTION = os.getenv("LINGBOT_FORCE_RESOLUTION", "").strip()
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 
-# Model repo must be a directory that contains generate_prequant.py + weights subfolders
 MODEL_REPO = Path(os.getenv("LINGBOT_MODEL_REPO", "/home/aw/Documents/models/lingbot")).resolve()
-
 if not MODEL_REPO.exists():
     raise RuntimeError(f"LINGBOT_MODEL_REPO not found: {MODEL_REPO}")
 
-# Ensure model repo is importable (generate_prequant.py lives there)
 if str(MODEL_REPO) not in sys.path:
     sys.path.insert(0, str(MODEL_REPO))
 
@@ -49,17 +51,15 @@ class InputStateModel(BaseModel):
     a: bool = False
     s: bool = False
     d: bool = False
-    space: bool = False  # idle toggle
-    mouseX: float = 0.0  # delta since last send
-    mouseY: float = 0.0  # delta since last send
-
+    space: bool = False
+    mouseX: float = 0.0
+    mouseY: float = 0.0
 
 class InputMsg(BaseModel):
     type: str = Field(pattern="^input$")
     seq: int
     client_ts_ms: int
     state: InputStateModel
-
 
 class TelemetryMsg(BaseModel):
     type: str = "telemetry"
@@ -71,7 +71,6 @@ class TelemetryMsg(BaseModel):
     lastInputSeq: int
     lastInputClientTsMs: int
 
-
 class CreateSessionResp(BaseModel):
     session_id: str
     ws_url: str
@@ -79,30 +78,17 @@ class CreateSessionResp(BaseModel):
     resolution: str
     quality: str
 
-
 # ============================================================
 # Config
 # ============================================================
 
-QUALITY_TO_STEPS = {
-    "latency": 8,
-    "balanced": 16,
-    "quality": 28,
-}
+QUALITY_TO_STEPS = {"latency": 8, "balanced": 16, "quality": 28}
+QUALITY_TO_GUIDE = {"latency": 4.0, "balanced": 5.0, "quality": 6.0}
 
-QUALITY_TO_GUIDE = {
-    "latency": 4.0,
-    "balanced": 5.0,
-    "quality": 6.0,
-}
-
-RES_TO_HW = {
-    "480p": (480, 832),
-    "720p": (720, 1280),
-}
+RES_TO_HW = {"480p": (480, 832), "720p": (720, 1280)}
 
 TARGET_FPS = float(os.getenv("LINGBOT_TARGET_FPS", "16"))
-CHUNK_FRAMES = max(5, int(os.getenv("LINGBOT_CHUNK_FRAMES", "9")))
+CHUNK_FRAMES = max(1, int(os.getenv("LINGBOT_CHUNK_FRAMES", "1")))  # IMPORTANT: allow 1
 
 LOW_WATER_FRAMES = int(os.getenv("LINGBOT_LOW_WATER_FRAMES", "18"))
 HIGH_WATER_FRAMES = int(os.getenv("LINGBOT_HIGH_WATER_FRAMES", "60"))
@@ -128,7 +114,6 @@ class CameraState:
     yaw: float = 0.0
     pitch: float = 0.0
 
-
 @dataclass
 class SessionState:
     session_id: str
@@ -136,18 +121,14 @@ class SessionState:
     resolution: str
     quality: str
     created_ms: int
-
-    # rolling init image
     init_img: Image.Image
 
-    # latest input
     latest_input: InputStateModel = field(default_factory=InputStateModel)
     latest_input_ts_ms: int = 0
     latest_input_seq: int = 0
 
     camera: CameraState = field(default_factory=CameraState)
 
-    # streaming
     frame_id: int = 0
     chunk_id: int = 0
     frame_queue: "asyncio.Queue[Tuple[Dict[str, Any], bytes]]" = field(
@@ -156,10 +137,8 @@ class SessionState:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     generator_task: Optional[asyncio.Task] = None
 
-    # perf
     last_chunk_gen_ms: float = 0.0
     last_chunk_fps: float = 0.0
-
 
 # ============================================================
 # App
@@ -167,19 +146,50 @@ class SessionState:
 
 app = FastAPI(title="LingBot-World Local Backend", version="0.2.0")
 
+logger = logging.getLogger("lingbot.server")
+logging.basicConfig(level=logging.INFO)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # safer; you don't need cookies here
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 PIPELINE: Optional[WanI2V_PreQuant] = None
 PIPELINE_LOCK = asyncio.Lock()
-
 SESSIONS: Dict[str, SessionState] = {}
 
+# ============================================================
+# Startup
+# ============================================================
+
+def log_runtime_environment() -> None:
+    logger.info("MODEL_REPO=%s", MODEL_REPO)
+    logger.info("MAX_SESSIONS=%s", MAX_SESSIONS)
+    logger.info("TARGET_FPS=%s", TARGET_FPS)
+    logger.info("CHUNK_FRAMES=%s", CHUNK_FRAMES)
+    logger.info("KEEP_MODELS_ON_GPU=%s", KEEP_MODELS_ON_GPU)
+    logger.info("LINGBOT_T5_CPU=%s", LINGBOT_T5_CPU)
+    logger.info("LINGBOT_FORCE_RESOLUTION=%s", LINGBOT_FORCE_RESOLUTION or "(none)")
+    try:
+        import torch
+        logger.info("torch.cuda.is_available=%s", torch.cuda.is_available())
+        if torch.cuda.is_available():
+            logger.info("torch.cuda.device_count=%s", torch.cuda.device_count())
+            for i in range(torch.cuda.device_count()):
+                logger.info("cuda:%d name=%s", i, torch.cuda.get_device_name(i))
+            logger.info("torch.cuda.current_device=%s", torch.cuda.current_device())
+    except Exception as e:
+        logger.warning("Failed to inspect torch CUDA environment: %s", e)
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    log_runtime_environment()
+    if LINGBOT_PRELOAD_ON_STARTUP:
+        logger.info("Preloading pipeline on startup...")
+        await ensure_pipeline_loaded()
 
 # ============================================================
 # Utils
@@ -212,21 +222,17 @@ def intrinsics_for_base_480x832(num_frames: int) -> np.ndarray:
     fy = base_w / 2.0
     cx = base_w / 2.0
     cy = base_h / 2.0
-    K = np.tile(np.array([fx, fy, cx, cy], dtype=np.float32), (num_frames, 1))
-    return K
+    return np.tile(np.array([fx, fy, cx, cy], dtype=np.float32), (num_frames, 1))
 
 def rot_yaw_pitch(yaw: float, pitch: float) -> np.ndarray:
     cy, sy = np.cos(yaw), np.sin(yaw)
     cp, sp = np.cos(pitch), np.sin(pitch)
-
     Ry = np.array([[ cy, 0.0, sy],
                    [0.0, 1.0, 0.0],
                    [-sy, 0.0, cy]], dtype=np.float32)
-
     Rx = np.array([[1.0, 0.0, 0.0],
                    [0.0,  cp, -sp],
                    [0.0,  sp,  cp]], dtype=np.float32)
-
     return Ry @ Rx
 
 def build_camera_poses(
@@ -237,21 +243,12 @@ def build_camera_poses(
     move_m_s: float = 1.2,
     mouse_sens: float = 0.002,
 ) -> Tuple[np.ndarray, CameraState]:
-    """
-    Produces camera-to-world transforms [F,4,4].
-
-    If inp.space is True (idle toggle), we ignore motion + mouse.
-    If no WASD pressed, we still generate frames (poses are constant).
-    """
     dt = 1.0 / fps
     out = np.zeros((frames, 4, 4), dtype=np.float32)
-
     cam2 = CameraState(cam.x, cam.y, cam.z, cam.yaw, cam.pitch)
 
     if inp.space:
-        # full idle: no mouse / no movement
-        mouse_dx = 0.0
-        mouse_dy = 0.0
+        mouse_dx = mouse_dy = 0.0
         w = a = s = d = False
     else:
         mouse_dx = float(inp.mouseX)
@@ -259,16 +256,11 @@ def build_camera_poses(
         w, a, s, d = inp.w, inp.a, inp.s, inp.d
 
     cam2.yaw += mouse_dx * mouse_sens
-    cam2.pitch += mouse_dy * mouse_sens
-    cam2.pitch = clamp(cam2.pitch, -1.2, 1.2)
+    cam2.pitch = clamp(cam2.pitch + mouse_dy * mouse_sens, -1.2, 1.2)
 
     for i in range(frames):
-        forward = 0.0
-        right = 0.0
-        if w: forward += 1.0
-        if s: forward -= 1.0
-        if d: right += 1.0
-        if a: right -= 1.0
+        forward = (1.0 if w else 0.0) + (-1.0 if s else 0.0)
+        right = (1.0 if d else 0.0) + (-1.0 if a else 0.0)
 
         mag = np.hypot(forward, right)
         if mag > 1e-6:
@@ -276,7 +268,6 @@ def build_camera_poses(
             right /= mag
 
         siny, cosy = np.sin(cam2.yaw), np.cos(cam2.yaw)
-
         cam2.x += (siny * forward + cosy * right) * move_m_s * dt
         cam2.z += (cosy * forward - siny * right) * move_m_s * dt
 
@@ -292,26 +283,14 @@ async def ensure_pipeline_loaded() -> WanI2V_PreQuant:
     global PIPELINE
     async with PIPELINE_LOCK:
         if PIPELINE is None:
+            logger.info("Loading WanI2V_PreQuant...")
+            logger.info("Using t5_cpu=%s", LINGBOT_T5_CPU)
             PIPELINE = WanI2V_PreQuant(
                 checkpoint_dir=str(MODEL_REPO),
-                t5_cpu=False,
+                t5_cpu=LINGBOT_T5_CPU,
             )
-
-            # Optional speed knob. May exceed VRAM on some setups; default is OFF.
-            if KEEP_MODELS_ON_GPU:
-                try:
-                    PIPELINE.low_noise_model.to(PIPELINE.device)
-                    PIPELINE.high_noise_model.to(PIPELINE.device)
-
-                    def _no_offload(t, boundary):
-                        return PIPELINE.high_noise_model if t.item() >= boundary else PIPELINE.low_noise_model
-
-                    PIPELINE._prepare_model_for_timestep = _no_offload  # type: ignore[attr-defined]
-                except Exception as e:
-                    print(f"[warn] KEEP_MODELS_ON_GPU failed, continuing with default offload: {e}")
-
+            logger.info("WanI2V_PreQuant loaded successfully")
         return PIPELINE
-
 
 # ============================================================
 # HTTP endpoints
@@ -329,13 +308,16 @@ async def create_session(
     quality: str = Form("balanced"),
     initImage: Optional[UploadFile] = File(None),
 ) -> CreateSessionResp:
+    if LINGBOT_FORCE_RESOLUTION:
+        resolution = LINGBOT_FORCE_RESOLUTION
+
     if resolution not in RES_TO_HW:
         raise HTTPException(status_code=400, detail=f"resolution must be one of {list(RES_TO_HW.keys())}")
     if quality not in QUALITY_TO_STEPS:
         raise HTTPException(status_code=400, detail=f"quality must be one of {list(QUALITY_TO_STEPS.keys())}")
 
     if len(SESSIONS) >= MAX_SESSIONS:
-        raise HTTPException(status_code=409, detail="Session limit reached (single-GPU config). Stop the existing session first.")
+        raise HTTPException(status_code=409, detail="Session limit reached. Stop the existing session first.")
 
     if initImage is not None:
         data = await initImage.read()
@@ -343,7 +325,6 @@ async def create_session(
         h, w = RES_TO_HW[resolution]
         img = img.resize((w, h), Image.BICUBIC)
     else:
-        # "No image provided": bootstrap with a neutral image (the model is i2v).
         img = make_default_init_image(resolution)
 
     sid = str(uuid.uuid4())
@@ -358,7 +339,7 @@ async def create_session(
     SESSIONS[sid] = st
 
     ws_path = f"/ws/session/{sid}"
-    base = str(request.base_url)  # e.g. http://HOST:8000/
+    base = str(request.base_url)
     ws_base = base.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
     ws_url = f"{ws_base}{ws_path}"
 
@@ -380,7 +361,6 @@ async def stop_session(session_id: str) -> Dict[str, Any]:
     if st.generator_task:
         st.generator_task.cancel()
 
-    # cleanup workdir
     workdir = APP_ROOT / "server" / ".work" / st.session_id
     if workdir.exists():
         shutil.rmtree(workdir, ignore_errors=True)
@@ -388,120 +368,125 @@ async def stop_session(session_id: str) -> Dict[str, Any]:
     del SESSIONS[session_id]
     return {"ok": True, "stopped": True}
 
-
 # ============================================================
 # Generator loop
 # ============================================================
 
 async def generator_loop(st: SessionState) -> None:
-    pipeline = await ensure_pipeline_loaded()
+    try:
+        pipeline = await ensure_pipeline_loaded()
 
-    sampling_steps = QUALITY_TO_STEPS[st.quality]
-    guide_scale = QUALITY_TO_GUIDE[st.quality]
+        sampling_steps = QUALITY_TO_STEPS[st.quality]
+        guide_scale = QUALITY_TO_GUIDE[st.quality]
 
-    h, w = RES_TO_HW[st.resolution]
-    max_area = h * w
+        h, w = RES_TO_HW[st.resolution]
+        max_area = h * w
 
-    workdir = APP_ROOT / "server" / ".work" / st.session_id
-    workdir.mkdir(parents=True, exist_ok=True)
+        workdir = APP_ROOT / "server" / ".work" / st.session_id
+        workdir.mkdir(parents=True, exist_ok=True)
 
-    while not st.stop_event.is_set():
-        # Backpressure: if buffer is large, yield CPU
-        if st.frame_queue.qsize() >= HIGH_WATER_FRAMES:
-            await asyncio.sleep(0.01)
-            continue
+        while not st.stop_event.is_set():
+            if st.frame_queue.qsize() >= HIGH_WATER_FRAMES:
+                await asyncio.sleep(0.01)
+                continue
 
-        # Snapshot input for the whole chunk (lowest-latency approach would be smaller chunks)
-        inp = st.latest_input
-        inp_seq = st.latest_input_seq
-        inp_ts = st.latest_input_ts_ms
+            inp = st.latest_input
+            inp_seq = st.latest_input_seq
+            inp_ts = st.latest_input_ts_ms
 
-        poses, new_cam = build_camera_poses(
-            st.camera,
-            inp,
-            frames=CHUNK_FRAMES,
-            fps=TARGET_FPS,
-        )
-        st.camera = new_cam
+            poses, new_cam = build_camera_poses(st.camera, inp, frames=CHUNK_FRAMES, fps=TARGET_FPS)
+            st.camera = new_cam
 
-        intr = intrinsics_for_base_480x832(num_frames=CHUNK_FRAMES)
+            intr = intrinsics_for_base_480x832(num_frames=CHUNK_FRAMES)
 
-        np.save(str(workdir / "poses.npy"), poses)
-        np.save(str(workdir / "intrinsics.npy"), intr)
+            np.save(str(workdir / "poses.npy"), poses)
+            np.save(str(workdir / "intrinsics.npy"), intr)
 
-        this_chunk_id = st.chunk_id
-        st.chunk_id += 1
+            this_chunk_id = st.chunk_id
+            st.chunk_id += 1
 
-        # Run GPU generation off the event loop
-        t0 = time.time()
-        video = await asyncio.to_thread(
-            pipeline.generate,
-            st.prompt,
-            st.init_img,
-            str(workdir),   # action_path expects poses.npy + intrinsics.npy
-            max_area,
-            CHUNK_FRAMES,
-            sampling_steps,
-            guide_scale,
-            -1,             # seed random
-        )
-        gen_ms = (time.time() - t0) * 1000.0
+            # IMPORTANT: keyword args to match generate_prequant.generate signature
+            t0 = time.time()
+            video = await asyncio.to_thread(
+                pipeline.generate,
+                input_prompt=st.prompt,
+                img=st.init_img,
+                action_path=str(workdir),
+                max_area=max_area,
+                frame_num=CHUNK_FRAMES,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                seed=-1,
+            )
+            gen_ms = (time.time() - t0) * 1000.0
 
-        # Convert torch tensor -> numpy uint8 frames
-        v = video.detach().float().cpu()
-        v = ((v + 1.0) * 0.5 * 255.0).clamp(0, 255).byte()
-        v = v.permute(1, 2, 3, 0).numpy()  # [F,H,W,C]
+            v = video.detach().float().cpu()
+            v = ((v + 1.0) * 0.5 * 255.0).clamp(0, 255).byte()
+            v = v.permute(1, 2, 3, 0).numpy()
 
-        # Rolling init = last frame
-        st.init_img = Image.fromarray(v[-1], mode="RGB")
+            st.init_img = Image.fromarray(v[-1], mode="RGB")
 
-        st.last_chunk_gen_ms = float(gen_ms)
-        st.last_chunk_fps = float(CHUNK_FRAMES) / max(1e-6, (gen_ms / 1000.0))
+            st.last_chunk_gen_ms = float(gen_ms)
+            st.last_chunk_fps = float(CHUNK_FRAMES) / max(1e-6, (gen_ms / 1000.0))
 
-        jpeg_q = JPEG_QUALITY_HQ if st.quality == "quality" else JPEG_QUALITY_LAT
+            jpeg_q = JPEG_QUALITY_HQ if st.quality == "quality" else JPEG_QUALITY_LAT
 
-        for i in range(v.shape[0]):
-            # Drop old frames if queue is full (latency > completeness)
-            if st.frame_queue.full():
-                try:
-                    _ = st.frame_queue.get_nowait()
-                except Exception:
-                    pass
+            for i in range(v.shape[0]):
+                if st.frame_queue.full():
+                    try:
+                        _ = st.frame_queue.get_nowait()
+                    except Exception:
+                        pass
 
-            jpeg = jpeg_encode_rgb(v[i], quality=jpeg_q)
-            header = {
-                "type": "frame",
-                "session_id": st.session_id,
-                "frame_id": st.frame_id,
-                "chunk_id": this_chunk_id,
-                "chunk_frame_idx": i,
-                "w": w,
-                "h": h,
-                "format": "jpeg",
-                "server_ts_ms": now_ms(),
-                "input_seq": inp_seq,
-                "input_client_ts_ms": inp_ts,
-            }
-            st.frame_id += 1
-            await st.frame_queue.put((header, jpeg))
+                jpeg = jpeg_encode_rgb(v[i], quality=jpeg_q)
+                header = {
+                    "type": "frame",
+                    "session_id": st.session_id,
+                    "frame_id": st.frame_id,
+                    "chunk_id": this_chunk_id,
+                    "chunk_frame_idx": i,
+                    "w": w,
+                    "h": h,
+                    "format": "jpeg",
+                    "server_ts_ms": now_ms(),
+                    "input_seq": inp_seq,
+                    "input_client_ts_ms": inp_ts,
+                }
+                st.frame_id += 1
+                await st.frame_queue.put((header, jpeg))
 
-        # If buffer is low, generate again immediately; else yield briefly
-        if st.frame_queue.qsize() < LOW_WATER_FRAMES:
-            continue
-        await asyncio.sleep(0.001)
+            if st.frame_queue.qsize() < LOW_WATER_FRAMES:
+                continue
+            await asyncio.sleep(0.001)
 
+    except asyncio.CancelledError:
+        logger.info("generator_loop cancelled for session %s", st.session_id)
+        raise
+    except Exception:
+        logger.exception("generator_loop failed for session %s", st.session_id)
+        st.stop_event.set()
 
 # ============================================================
 # WebSocket endpoint
 # ============================================================
-
 @app.websocket("/ws/session/{session_id}")
 async def ws_session(ws: WebSocket, session_id: str) -> None:
-    await ws.accept()
+    accepted = False
+    closed = False
+
+    try:
+        await ws.accept()
+        accepted = True
+    except RuntimeError:
+        return
 
     st = SESSIONS.get(session_id)
     if not st:
-        await ws.close(code=1008)
+        if accepted and not closed:
+            try:
+                await ws.close(code=1008)
+            except RuntimeError:
+                pass
         return
 
     if st.generator_task is None or st.generator_task.done():
@@ -528,21 +513,35 @@ async def ws_session(ws: WebSocket, session_id: str) -> None:
 
     try:
         while True:
-            # Send frame if available
+            if st.stop_event.is_set() and (st.generator_task is None or st.generator_task.done()) and st.frame_queue.empty():
+                if not closed:
+                    try:
+                        await ws.close(code=1011, reason="generation stopped")
+                    except RuntimeError:
+                        pass
+                    closed = True
+                break
+
             try:
                 header, jpeg = await asyncio.wait_for(st.frame_queue.get(), timeout=0.05)
-                await ws.send_bytes(pack_binary_frame(header, jpeg))
+                if not closed:
+                    try:
+                        await ws.send_bytes(pack_binary_frame(header, jpeg))
+                    except RuntimeError:
+                        closed = True
+                        break
             except asyncio.TimeoutError:
                 pass
 
-            # Telemetry
             tms = now_ms()
             if tms - last_telemetry_ms >= telemetry_interval_ms:
                 last_telemetry_ms = tms
                 buffer_ms = (st.frame_queue.qsize() / TARGET_FPS) * 1000.0
 
-                # Approx "input age" (for now). Real input->display latency is computed client-side.
-                latency_ms = float(tms - st.latest_input_ts_ms) if st.latest_input_ts_ms else 0.0
+                if st.latest_input_ts_ms:
+                    latency_ms = max(0.0, float(tms - st.latest_input_ts_ms))
+                else:
+                    latency_ms = 0.0
 
                 tel = TelemetryMsg(
                     server_ts_ms=tms,
@@ -553,10 +552,16 @@ async def ws_session(ws: WebSocket, session_id: str) -> None:
                     lastInputSeq=int(st.latest_input_seq),
                     lastInputClientTsMs=int(st.latest_input_ts_ms),
                 )
-                await ws.send_text(tel.model_dump_json())
+
+                if not closed:
+                    try:
+                        await ws.send_text(tel.model_dump_json())
+                    except RuntimeError:
+                        closed = True
+                        break
 
     except WebSocketDisconnect:
-        pass
+        closed = True
     finally:
         recv_task.cancel()
         if STOP_ON_DISCONNECT:

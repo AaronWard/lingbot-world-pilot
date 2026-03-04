@@ -1,42 +1,215 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { ConnectionStatus, InputState, QualityProfile, SessionConfig, Telemetry } from '../types';
-import { WEBSOCKET_RATE_MS, MOCK_LATENCY_BASE } from '../constants';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActiveSession,
+  ConnectionStatus,
+  FrameHeader,
+  InputState,
+  Telemetry,
+  TelemetryMessage,
+} from '../types';
 import { HUD } from './HUD';
 import { Button } from './Button';
+import { INPUT_SEND_RATE_MS, MAX_LATENCY_HISTORY } from '../constants';
 
 interface WorldViewportProps {
-  config: SessionConfig;
+  config: ActiveSession;
   onExit: () => void;
+}
+
+interface ParsedFramePacket {
+  header: FrameHeader;
+  jpegBytes: Uint8Array;
+}
+
+function parseFramePacket(buffer: ArrayBuffer): ParsedFramePacket {
+  if (buffer.byteLength < 4) {
+    throw new Error('Frame packet too small.');
+  }
+
+  const view = new DataView(buffer);
+  const headerLength = view.getUint32(0, true);
+
+  if (buffer.byteLength < 4 + headerLength) {
+    throw new Error('Invalid frame packet header length.');
+  }
+
+  const headerBytes = new Uint8Array(buffer, 4, headerLength);
+  const headerJson = new TextDecoder().decode(headerBytes);
+  const header = JSON.parse(headerJson) as FrameHeader;
+  const jpegBytes = new Uint8Array(buffer, 4 + headerLength);
+
+  return { header, jpegBytes };
+}
+
+async function decodeJpegToImageSource(
+  jpegBytes: Uint8Array
+): Promise<ImageBitmap | HTMLImageElement> {
+  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+
+  if ('createImageBitmap' in window) {
+    return await createImageBitmap(blob);
+  }
+
+  return await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Failed to decode JPEG frame.'));
+    };
+
+    img.src = url;
+  });
 }
 
 export const WorldViewport: React.FC<WorldViewportProps> = ({ config, onExit }) => {
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.CONNECTING);
-  const [telemetry, setTelemetry] = useState<Telemetry>({ fps: 0, bufferMs: 0, latencyMs: 0, generationTimeMs: 0 });
-  const [latencyHistory, setLatencyHistory] = useState<{timestamp: number, value: number}[]>([]);
-  
-  // Refs for state that changes too fast for React state
-  const inputState = useRef<InputState>({
-    w: false, a: false, s: false, d: false, space: false, mouseX: 0, mouseY: 0
+  const [telemetry, setTelemetry] = useState<Telemetry>({
+    fps: 0,
+    bufferMs: 0,
+    latencyMs: 0,
+    generationTimeMs: 0,
   });
-  
-  // Simulation State
-  const cameraPos = useRef({ x: 0, y: 0, z: 0, yaw: 0, pitch: 0 });
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const requestRef = useRef<number>();
-  const lastTimeRef = useRef<number>(0);
-  const wsIntervalRef = useRef<number>();
+  const [latencyHistory, setLatencyHistory] = useState<{ timestamp: number; value: number }[]>([]);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [hasReceivedFrame, setHasReceivedFrame] = useState(false);
 
-  // Input Event Handlers
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const inputSendIntervalRef = useRef<number | null>(null);
+  const frameDrawTokenRef = useRef(0);
+
+  const inputState = useRef<InputState>({
+    w: false,
+    a: false,
+    s: false,
+    d: false,
+    space: false,
+    mouseX: 0,
+    mouseY: 0,
+  });
+
+  const inputSeqRef = useRef(0);
+
+  const drawPlaceholder = useCallback(
+    (title: string, subtitle?: string) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const width = canvas.width;
+      const height = canvas.height;
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#050505';
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.strokeStyle = '#1f1f22';
+      ctx.lineWidth = 1;
+
+      const horizonY = Math.floor(height * 0.42);
+      const vanishX = width / 2;
+      const gridHalfWidth = Math.floor(width * 0.48);
+
+      for (let x = -gridHalfWidth; x <= gridHalfWidth; x += 50) {
+        ctx.beginPath();
+        ctx.moveTo(vanishX + x * 0.35, horizonY);
+        ctx.lineTo(vanishX + x, height);
+        ctx.stroke();
+      }
+
+      for (let y = horizonY; y <= height; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = '#71717a';
+      ctx.font = '600 24px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(title, width / 2, height / 2 - 10);
+
+      if (subtitle) {
+        ctx.fillStyle = '#52525b';
+        ctx.font = '14px Inter, sans-serif';
+        ctx.fillText(subtitle, width / 2, height / 2 + 22);
+      }
+    },
+    []
+  );
+
+  const drawFrame = useCallback(async (buffer: ArrayBuffer) => {
+    const currentToken = ++frameDrawTokenRef.current;
+    const { header, jpegBytes } = parseFramePacket(buffer);
+    const imageSource = await decodeJpegToImageSource(jpegBytes);
+
+    if (currentToken !== frameDrawTokenRef.current) {
+      if ('close' in imageSource && typeof imageSource.close === 'function') {
+        imageSource.close();
+      }
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      if ('close' in imageSource && typeof imageSource.close === 'function') {
+        imageSource.close();
+      }
+      return;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      if ('close' in imageSource && typeof imageSource.close === 'function') {
+        imageSource.close();
+      }
+      return;
+    }
+
+    if (canvas.width !== header.w || canvas.height !== header.h) {
+      canvas.width = header.w;
+      canvas.height = header.h;
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(imageSource, 0, 0, canvas.width, canvas.height);
+
+    if ('close' in imageSource && typeof imageSource.close === 'function') {
+      imageSource.close();
+    }
+
+    setHasReceivedFrame(true);
+  }, []);
+
+  useEffect(() => {
+    drawPlaceholder('Initializing Stream', 'Waiting for backend connection...');
+  }, [drawPlaceholder]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
+
       if (key === 'w') inputState.current.w = true;
       if (key === 'a') inputState.current.a = true;
       if (key === 's') inputState.current.s = true;
       if (key === 'd') inputState.current.d = true;
-      if (key === ' ') inputState.current.space = !inputState.current.space; // toggle
-      if (key === 'r') {
-         cameraPos.current = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
+
+      if (key === ' ' && !e.repeat) {
+        e.preventDefault();
+        inputState.current.space = !inputState.current.space;
+      }
+
+      if (key === 'escape' && document.pointerLockElement === canvasRef.current) {
+        document.exitPointerLock();
       }
     };
 
@@ -49,18 +222,22 @@ export const WorldViewport: React.FC<WorldViewportProps> = ({ config, onExit }) 
     };
 
     const handleMouseMove = (e: MouseEvent) => {
-      inputState.current.mouseX = e.movementX;
-      inputState.current.mouseY = e.movementY;
-    };
+      if (document.pointerLockElement !== canvasRef.current) {
+        return;
+      }
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('mousemove', handleMouseMove);
+      inputState.current.mouseX += e.movementX;
+      inputState.current.mouseY += e.movementY;
+    };
 
     const canvas = canvasRef.current;
     const handleCanvasClick = () => {
       canvas?.requestPointerLock();
     };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('mousemove', handleMouseMove);
     canvas?.addEventListener('click', handleCanvasClick);
 
     return () => {
@@ -71,155 +248,160 @@ export const WorldViewport: React.FC<WorldViewportProps> = ({ config, onExit }) 
     };
   }, []);
 
-  // "WebSocket" Loop
   useEffect(() => {
-    const connectTimer = setTimeout(() => {
-      setStatus(ConnectionStatus.CONNECTED);
-    }, 1500);
+    const ws = new WebSocket(config.wsUrl);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
 
-    wsIntervalRef.current = window.setInterval(() => {
+    setStatus(ConnectionStatus.CONNECTING);
+    setHasReceivedFrame(false);
+    drawPlaceholder('Initializing Stream', 'Connecting to local renderer...');
+
+    ws.onopen = () => {
+      setStatus(ConnectionStatus.CONNECTED);
+    };
+
+    ws.onerror = () => {
+      setStatus(ConnectionStatus.ERROR);
+      if (!hasReceivedFrame) {
+        drawPlaceholder('Stream Error', 'Failed to connect to renderer.');
+      }
+    };
+
+    ws.onclose = () => {
+      if (!disconnecting) {
+        setStatus(ConnectionStatus.DISCONNECTED);
+        if (!hasReceivedFrame) {
+          drawPlaceholder('Disconnected', 'Session closed.');
+        }
+      }
+    };
+
+    ws.onmessage = async (event) => {
+      try {
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data) as TelemetryMessage;
+
+          if (msg.type === 'telemetry') {
+            setTelemetry({
+              fps: msg.fps,
+              bufferMs: msg.bufferMs,
+              latencyMs: msg.latencyMs,
+              generationTimeMs: msg.generationTimeMs,
+            });
+
+            setLatencyHistory((prev) => {
+              const next = [
+                ...prev,
+                {
+                  timestamp: Date.now(),
+                  value: msg.latencyMs,
+                },
+              ];
+              return next.slice(-MAX_LATENCY_HISTORY);
+            });
+          }
+
+          return;
+        }
+
+        const arrayBuffer =
+          event.data instanceof ArrayBuffer
+            ? event.data
+            : event.data instanceof Blob
+              ? await event.data.arrayBuffer()
+              : null;
+
+        if (!arrayBuffer) {
+          return;
+        }
+
+        await drawFrame(arrayBuffer);
+      } catch (err) {
+        console.error('Failed to handle WebSocket message:', err);
+      }
+    };
+
+    inputSendIntervalRef.current = window.setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const seq = inputSeqRef.current++;
+      const payload = {
+        type: 'input',
+        seq,
+        client_ts_ms: Date.now(),
+        state: {
+          ...inputState.current,
+        },
+      };
+
+      ws.send(JSON.stringify(payload));
+
       inputState.current.mouseX = 0;
       inputState.current.mouseY = 0;
-
-      setTelemetry(prev => {
-        const load = (inputState.current.w || inputState.current.a || inputState.current.s || inputState.current.d) ? 1.2 : 0.8;
-        const newLat = MOCK_LATENCY_BASE * load + (Math.random() * 20 - 10);
-        
-        return {
-          fps: 16 + (Math.random() * 2 - 1),
-          bufferMs: 800 + (Math.random() * 100 - 50),
-          latencyMs: newLat,
-          generationTimeMs: 55 + (Math.random() * 5),
-        };
-      });
-
-      setLatencyHistory(prev => {
-        const newHistory = [...prev, { timestamp: Date.now(), value: MOCK_LATENCY_BASE + (Math.random() * 20) }];
-        if (newHistory.length > 50) newHistory.shift();
-        return newHistory;
-      });
-
-    }, WEBSOCKET_RATE_MS);
+    }, INPUT_SEND_RATE_MS);
 
     return () => {
-      clearTimeout(connectTimer);
-      clearInterval(wsIntervalRef.current);
-    };
-  }, []);
-
-  // Client-Side Rendering Loop
-  const animate = useCallback((time: number) => {
-    if (!lastTimeRef.current) lastTimeRef.current = time;
-    const deltaTime = (time - lastTimeRef.current) / 1000;
-    lastTimeRef.current = time;
-
-    const speed = 5 * deltaTime;
-    
-    // Simple movement logic
-    if (inputState.current.w) {
-      cameraPos.current.z += Math.cos(cameraPos.current.yaw) * speed;
-      cameraPos.current.x += Math.sin(cameraPos.current.yaw) * speed;
-    }
-    if (inputState.current.s) {
-      cameraPos.current.z -= Math.cos(cameraPos.current.yaw) * speed;
-      cameraPos.current.x -= Math.sin(cameraPos.current.yaw) * speed;
-    }
-    if (inputState.current.a) {
-      cameraPos.current.x -= Math.cos(cameraPos.current.yaw) * speed;
-      cameraPos.current.z += Math.sin(cameraPos.current.yaw) * speed;
-    }
-    if (inputState.current.d) {
-      cameraPos.current.x += Math.cos(cameraPos.current.yaw) * speed;
-      cameraPos.current.z -= Math.sin(cameraPos.current.yaw) * speed;
-    }
-
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        // Clear background
-        ctx.fillStyle = '#0a0a0b'; // Zinc 950
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        // Draw Grid
-        ctx.strokeStyle = '#27272a'; // Zinc 800
-        ctx.lineWidth = 1;
-        
-        const gridSize = 50;
-        const width = canvas.width;
-        const height = canvas.height;
-        const offsetX = (cameraPos.current.x * 100) % gridSize;
-        const offsetY = (cameraPos.current.z * 100) % gridSize;
-
-        ctx.save();
-        ctx.translate(width/2, height/2);
-        
-        if (inputState.current.w || inputState.current.a || inputState.current.s || inputState.current.d) {
-           ctx.translate(Math.random() * 1 - 0.5, Math.random() * 1 - 0.5);
-        }
-        
-        // Floor grid
-        ctx.beginPath();
-        for(let i = -10; i <= 10; i++) {
-            // Vertical (Z)
-            ctx.moveTo(i * gridSize - offsetX, -height/2);
-            ctx.lineTo((i * gridSize - offsetX) * 4, height/2);
-            
-            // Horizontal (X)
-            ctx.moveTo(-width/2, i * gridSize + offsetY);
-            ctx.lineTo(width/2, i * gridSize + offsetY);
-        }
-        ctx.stroke();
-
-        // Text
-        ctx.fillStyle = '#52525b'; // Zinc 600
-        ctx.font = '12px Inter, sans-serif';
-        ctx.fillText("Rendering Geometry...", -60, -20);
-        
-        ctx.fillStyle = '#3f3f46'; // Zinc 700
-        ctx.font = '10px Inter, sans-serif';
-        const promptPreview = config.prompt.length > 50 ? config.prompt.substring(0, 50) + "..." : config.prompt;
-        ctx.fillText(promptPreview, -100, 0);
-
-        ctx.restore();
+      if (inputSendIntervalRef.current !== null) {
+        clearInterval(inputSendIntervalRef.current);
       }
-    }
 
-    requestRef.current = requestAnimationFrame(animate);
-  }, [config.prompt]);
+      wsRef.current = null;
 
-  useEffect(() => {
-    requestRef.current = requestAnimationFrame(animate);
-    return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
     };
-  }, [animate]);
+  }, [config.wsUrl, disconnecting, drawFrame, drawPlaceholder, hasReceivedFrame]);
+
+  const handleDisconnect = useCallback(async () => {
+    setDisconnecting(true);
+
+    try {
+      const ws = wsRef.current;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close();
+      }
+
+      await fetch(`${config.apiBaseUrl}/api/session/${config.sessionId}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      console.error('Failed to stop session cleanly:', err);
+    } finally {
+      onExit();
+    }
+  }, [config.apiBaseUrl, config.sessionId, onExit]);
 
   return (
     <div className="relative w-full h-screen bg-black overflow-hidden flex flex-col items-center justify-center">
-      
-      {/* Main Stream View */}
       <div className="relative w-full h-full bg-black flex items-center justify-center">
-        <canvas 
+        <canvas
           ref={canvasRef}
-          width={config.resolution === '720p' ? 1280 : 854}
+          width={config.resolution === '720p' ? 1280 : 832}
           height={config.resolution === '720p' ? 720 : 480}
           className="max-w-full max-h-full object-contain"
         />
-        
-        {/* Connection Overlay */}
-        {status !== ConnectionStatus.CONNECTED && (
-          <div className="absolute inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-30">
-             <div className="flex flex-col items-center gap-6">
-               <div className="h-0.5 w-48 bg-zinc-800 rounded overflow-hidden">
-                 <div className="h-full bg-white animate-[width_1.5s_ease-in-out_infinite]" style={{width: '30%'}}></div>
-               </div>
-               <div className="text-zinc-400 font-sans text-xs tracking-widest uppercase">Initializing Stream</div>
-             </div>
+
+        {status !== ConnectionStatus.CONNECTED && !hasReceivedFrame && (
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-[1px] flex items-center justify-center z-30">
+            <div className="flex flex-col items-center gap-6">
+              <div className="h-0.5 w-48 bg-zinc-800 rounded overflow-hidden">
+                <div
+                  className="h-full bg-white animate-[width_1.5s_ease-in-out_infinite]"
+                  style={{ width: '30%' }}
+                />
+              </div>
+              <div className="text-zinc-400 font-sans text-xs tracking-widest uppercase">
+                {status === ConnectionStatus.ERROR ? 'Renderer Error' : 'Initializing Stream'}
+              </div>
+            </div>
           </div>
         )}
 
-        <HUD 
+        <HUD
           status={status}
           telemetry={telemetry}
           quality={config.quality}
@@ -228,9 +410,13 @@ export const WorldViewport: React.FC<WorldViewportProps> = ({ config, onExit }) 
         />
       </div>
 
-      {/* Exit Button */}
       <div className="absolute top-6 right-6 z-50">
-        <Button variant="secondary" onClick={onExit} className="text-xs py-1.5 px-4 bg-black/50 backdrop-blur-sm border-zinc-800">
+        <Button
+          variant="secondary"
+          onClick={handleDisconnect}
+          isLoading={disconnecting}
+          className="text-xs py-1.5 px-4 bg-black/50 backdrop-blur-sm border-zinc-800"
+        >
           Disconnect
         </Button>
       </div>
