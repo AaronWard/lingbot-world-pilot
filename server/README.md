@@ -1,5 +1,14 @@
 
 
+## Run Web Application
+
+```sh
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+npm install
+npm run dev
+```
+
+---
 
 ## Installation steps (NF4 repo + backend deps)
 
@@ -19,38 +28,49 @@ pip install -r server/requirements_server.txt
 
 ## Run Server
 
-```sh
-# export CUDA_VISIBLE_DEVICES=GPU-11481043-00bd-5b3f-02e7-3138b3f915be
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-# export CUDA_VISIBLE_DEVICES=GPU-11481043-00bd-5b3f-02e7-3138b3f915be   # the 5090 UUID
+
+```
 export CUDA_VISIBLE_DEVICES=1
-export LINGBOT_MODEL_REPO=/home/aw/Documents/models/lingbot
-export LINGBOT_MAX_SESSIONS=1
-export LINGBOT_TARGET_FPS=4
-export LINGBOT_CHUNK_FRAMES=1
-export LINGBOT_LOW_WATER_FRAMES=2
-export LINGBOT_HIGH_WATER_FRAMES=6
 export LINGBOT_KEEP_MODELS_ON_GPU=0
+```
+
+```bash
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+conda activate lingbot
+
+# GPU ordering — ensures cuda:0 = 5090, cuda:1 = 4060
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+# Model path
+export LINGBOT_MODEL_REPO=/home/aw/Documents/models/lingbot
+
+# Session limits
+export LINGBOT_MAX_SESSIONS=1
+
+# Generation settings (these override the code defaults if you want to tune)
+export LINGBOT_CHUNK_FRAMES=5
+export LINGBOT_TARGET_FPS=16
+
+# Buffer management
+export LINGBOT_LOW_WATER_FRAMES=10
+export LINGBOT_HIGH_WATER_FRAMES=30
+
+# Preload everything on startup (T5 + both DiTs)
+export LINGBOT_PRELOAD_ON_STARTUP=1
+
+# T5 on CPU flag — the code now auto-detects cuda:1, but keep this for fallback
+export LINGBOT_T5_CPU=1
+
+# Cleanup on disconnect
 export LINGBOT_STOP_ON_DISCONNECT=1
+
+# CORS — allow your frontend
 export LINGBOT_CORS_ORIGINS=*
 
-
-conda activate lingbot 
-
-cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+# Launch
 python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+
 ```
-
-
-## Run Web Application
-
-```sh
-cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
-npm install
-npm run dev
-```
-
-
 ---
 
 

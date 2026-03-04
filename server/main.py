@@ -17,12 +17,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image
 
+import torch
+torch.set_float32_matmul_precision('high')
+
+
 # ============================================================
 # Paths / Imports
 # ============================================================
 
 LINGBOT_T5_CPU = os.getenv("LINGBOT_T5_CPU", "1") == "1"
-LINGBOT_PRELOAD_ON_STARTUP = os.getenv("LINGBOT_PRELOAD_ON_STARTUP", "0") == "1"
+LINGBOT_PRELOAD_ON_STARTUP = os.getenv("LINGBOT_PRELOAD_ON_STARTUP", "1") == "1"
 LINGBOT_FORCE_RESOLUTION = os.getenv("LINGBOT_FORCE_RESOLUTION", "").strip()
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -82,13 +86,13 @@ class CreateSessionResp(BaseModel):
 # Config
 # ============================================================
 
-QUALITY_TO_STEPS = {"latency": 8, "balanced": 8, "quality": 16}
-QUALITY_TO_GUIDE = {"latency": 1.0, "balanced": 5.0, "quality": 6.0}
+QUALITY_TO_STEPS = {"latency": 8, "balanced": 12, "quality": 16}
+QUALITY_TO_GUIDE = {"latency": 2.0, "balanced": 5.0, "quality": 6.0}
 
 RES_TO_HW = {"480p": (480, 832), "720p": (720, 1280)}
 
 TARGET_FPS = float(os.getenv("LINGBOT_TARGET_FPS", "16"))
-CHUNK_FRAMES = max(1, int(os.getenv("LINGBOT_CHUNK_FRAMES", "9")))  # IMPORTANT: allow 1
+CHUNK_FRAMES = max(1, int(os.getenv("LINGBOT_CHUNK_FRAMES", "5")))
 
 LOW_WATER_FRAMES = int(os.getenv("LINGBOT_LOW_WATER_FRAMES", "18"))
 HIGH_WATER_FRAMES = int(os.getenv("LINGBOT_HIGH_WATER_FRAMES", "60"))
@@ -240,10 +244,8 @@ def build_camera_poses(
     inp: InputStateModel,
     frames: int,
     fps: float,
-    # move_m_s: float = 1.2,
-    move_m_s: float = 10,
-    # mouse_sens: float = 0.002,
-    mouse_sens: float = 0.02,
+    move_m_s: float = 2.0,
+    mouse_sens: float = 0.004,
 ) -> Tuple[np.ndarray, CameraState]:
     dt = 1.0 / fps
     out = np.zeros((frames, 4, 4), dtype=np.float32)
@@ -286,12 +288,34 @@ async def ensure_pipeline_loaded() -> WanI2V_PreQuant:
     async with PIPELINE_LOCK:
         if PIPELINE is None:
             logger.info("Loading WanI2V_PreQuant...")
-            logger.info("Using t5_cpu=%s", LINGBOT_T5_CPU)
+
+            import torch as _torch
+            # With PCI_BUS_ID: cuda:0 = 4060 (8GB), cuda:1 = 5090 (32GB)
+            # T5-XXL is ~10GB in bf16 — too big for the 4060, so keep on CPU
+            # DiTs + VAE go on the 5090
+            dit_device_id = 1 if _torch.cuda.device_count() >= 2 else 0
+            t5_device_str = "cpu"
+            vae_device_str = "cuda:0" if _torch.cuda.device_count() >= 2 else None
+
+            logger.info("T5 on CPU, DiTs on cuda:%d", dit_device_id)
+
             PIPELINE = WanI2V_PreQuant(
                 checkpoint_dir=str(MODEL_REPO),
-                t5_cpu=LINGBOT_T5_CPU,
+                device_id=dit_device_id,
+                t5_cpu=True,
+                t5_device_str=t5_device_str,
+                vae_device_str=vae_device_str,
             )
             logger.info("WanI2V_PreQuant loaded successfully")
+
+            # Preload both DiT models onto GPU immediately
+            logger.info("Preloading both DiT models onto GPU...")
+            PIPELINE._lazy_load_high()
+            PIPELINE._lazy_load_low()
+            PIPELINE.high_noise_model.to(PIPELINE.device)
+            PIPELINE.low_noise_model.to(PIPELINE.device)
+            logger.info("Both DiT models on GPU, ready for inference")
+
         return PIPELINE
 
 # ============================================================
@@ -387,11 +411,37 @@ async def generator_loop(st: SessionState) -> None:
         workdir = APP_ROOT / "server" / ".work" / st.session_id
         workdir.mkdir(parents=True, exist_ok=True)
 
+        # Send the init image as frame 0 immediately so the user sees something
+        import torchvision.transforms.functional as TF_server
+        init_np = np.array(st.init_img)
+        jpeg_q = JPEG_QUALITY_HQ if st.quality == "quality" else JPEG_QUALITY_LAT
+        jpeg = jpeg_encode_rgb(init_np, quality=jpeg_q)
+        header = {
+            "type": "frame",
+            "session_id": st.session_id,
+            "frame_id": st.frame_id,
+            "chunk_id": -1,
+            "chunk_frame_idx": 0,
+            "w": w,
+            "h": h,
+            "format": "jpeg",
+            "server_ts_ms": now_ms(),
+            "input_seq": 0,
+            "input_client_ts_ms": 0,
+        }
+        st.frame_id += 1
+        await st.frame_queue.put((header, jpeg))
+
+        # Keep a raw tensor for the conditioning image to avoid JPEG roundtrip
+        # This is the key quality fix: no lossy compression between chunks
+        raw_last_frame_tensor = None  # Will be set after first chunk
+
         while not st.stop_event.is_set():
             if st.frame_queue.qsize() >= HIGH_WATER_FRAMES:
                 await asyncio.sleep(0.01)
                 continue
 
+            # Sample input as late as possible for responsiveness
             inp = st.latest_input
             inp_seq = st.latest_input_seq
             inp_ts = st.latest_input_ts_ms
@@ -407,12 +457,12 @@ async def generator_loop(st: SessionState) -> None:
             this_chunk_id = st.chunk_id
             st.chunk_id += 1
 
-            # IMPORTANT: keyword args to match generate_prequant.generate signature
             t0 = time.time()
             video = await asyncio.to_thread(
                 pipeline.generate,
                 input_prompt=st.prompt,
                 img=st.init_img,
+                raw_init_tensor=raw_last_frame_tensor,  # Pass raw tensor
                 action_path=str(workdir),
                 max_area=max_area,
                 frame_num=CHUNK_FRAMES,
@@ -422,16 +472,21 @@ async def generator_loop(st: SessionState) -> None:
             )
             gen_ms = (time.time() - t0) * 1000.0
 
+            # Keep the raw last frame tensor for next chunk (NO JPEG roundtrip)
+            # raw_last_frame_tensor = video[:, -1:, :, :].detach().clone()
+            raw_last_frame_tensor = video[:, -1:, :, :].detach().to(PIPELINE.device).clone()
+
+
             v = video.detach().float().cpu()
             v = ((v + 1.0) * 0.5 * 255.0).clamp(0, 255).byte()
             v = v.permute(1, 2, 3, 0).numpy()
 
+            # Still update init_img for PIL fallback, but raw_last_frame_tensor
+            # is what actually gets used for conditioning
             st.init_img = Image.fromarray(v[-1], mode="RGB")
 
             st.last_chunk_gen_ms = float(gen_ms)
             st.last_chunk_fps = float(CHUNK_FRAMES) / max(1e-6, (gen_ms / 1000.0))
-
-            jpeg_q = JPEG_QUALITY_HQ if st.quality == "quality" else JPEG_QUALITY_LAT
 
             for i in range(v.shape[0]):
                 if st.frame_queue.full():
