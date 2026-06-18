@@ -27,7 +27,8 @@ the decoded frames back as JPEGs.
 Env config (all optional, sensible defaults):
   LW_CKPT_DIR        path to the base-cam checkpoint dir (must contain T5, VAE,
                      tokenizer, and the lingbot_world_fast/ subfolder)
-  LW_DEVICE_ID       CUDA device for the DiT+VAE (default 1 -> the 5090)
+  LW_DEVICE_ID       CUDA device for the DiT / streaming core (default 1 -> the 5090)
+  LW_VAE_DEVICE_ID   CUDA device for the VAE (default same as LW_DEVICE_ID)
   LW_T5_CPU          "1" to keep T5 on CPU (default 1; 4060 is too small for it)
   LW_LOCAL_ATTN      rolling KV window in latent frames (default 12 ~= 3s, ~15GB)
   LW_SINK            pinned origin frames (default 1)
@@ -67,18 +68,19 @@ from wan.streaming_fast import WanI2VFastStreaming        # noqa: E402
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-CKPT_DIR     = os.environ.get("LW_CKPT_DIR", "/mnt/data4tb/lingbot-world-base-cam")
-DEVICE_ID    = int(os.environ.get("LW_DEVICE_ID", "1"))   # 5090 = cuda:1
-T5_CPU       = os.environ.get("LW_T5_CPU", "1") == "1"
-LOCAL_ATTN   = int(os.environ.get("LW_LOCAL_ATTN", "8"))  # ~2s window, ~10GB KV
-SINK         = int(os.environ.get("LW_SINK", "1"))
-CHUNK        = int(os.environ.get("LW_CHUNK", "3"))
-SHIFT        = float(os.environ.get("LW_SHIFT", "10.0"))  # i2v-A14B config default; Fast was distilled on this
-MAX_AREA     = int(eval(os.environ.get("LW_MAX_AREA", "480*832")))  # noqa: S307 (trusted env)
-QUANT        = os.environ.get("LW_QUANT", "").lower()
+CKPT_DIR      = os.environ.get("LW_CKPT_DIR", "/mnt/data4tb/lingbot-world-base-cam")
+DEVICE_ID     = int(os.environ.get("LW_DEVICE_ID", "1"))   # 5090 = cuda:1
+VAE_DEVICE_ID = int(os.environ.get("LW_VAE_DEVICE_ID", str(DEVICE_ID)))
+T5_CPU        = os.environ.get("LW_T5_CPU", "1") == "1"
+LOCAL_ATTN    = int(os.environ.get("LW_LOCAL_ATTN", "8"))  # ~2s window, ~10GB KV
+SINK          = int(os.environ.get("LW_SINK", "1"))
+CHUNK         = int(os.environ.get("LW_CHUNK", "3"))
+SHIFT         = float(os.environ.get("LW_SHIFT", "10.0"))  # i2v-A14B config default; Fast was distilled on this
+MAX_AREA      = int(eval(os.environ.get("LW_MAX_AREA", "480*832")))  # noqa: S307 (trusted env)
+QUANT         = os.environ.get("LW_QUANT", "").lower()
 FAST_SUBFOLDER = os.environ.get("LW_FAST_SUBFOLDER", "lingbot_world_fast")
-PREQUANT     = os.environ.get("LW_PREQUANTIZED", "0") == "1"
-FPS          = 16
+PREQUANT      = os.environ.get("LW_PREQUANTIZED", "0") == "1"
+FPS           = 16
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -204,6 +206,119 @@ def _install_quant_patch():
     else:
         raise ValueError(f"unknown LW_QUANT={QUANT!r}")
 
+def _move_pipe_vae_to_device(pipe: WanI2VFastStreaming, vae_device_id: int) -> torch.device:
+    """Move the VAE's underlying torch module/state to a separate CUDA device.
+
+    Wan2_1_VAE is a wrapper, not necessarily an nn.Module, so pipe.vae.to(...)
+    may not exist. This moves the wrapper's torch modules/tensors, including
+    nested tensor containers like self.scale, and wraps encode/decode so tensors
+    cross the DiT<->VAE device boundary explicitly.
+    """
+    vae_device = torch.device(f"cuda:{vae_device_id}")
+    dit_device = torch.device(f"cuda:{DEVICE_ID}")
+
+    vae = getattr(pipe, "vae", None)
+
+    if vae is None and hasattr(pipe, "model"):
+        vae = getattr(pipe.model, "vae", None)
+
+    if vae is None:
+        print("[lingbot] WARNING: could not find VAE object to move", flush=True)
+        return vae_device
+
+    if vae_device_id == DEVICE_ID:
+        print(f"[lingbot] VAE staying on cuda:{DEVICE_ID}", flush=True)
+        return vae_device
+
+    moved = []
+
+    def move_obj(obj, device):
+        if isinstance(obj, torch.nn.Module):
+            obj.to(device)
+            return obj
+
+        if torch.is_tensor(obj):
+            return obj.to(device, non_blocking=True)
+
+        if isinstance(obj, list):
+            return [move_obj(x, device) for x in obj]
+
+        if isinstance(obj, tuple):
+            return tuple(move_obj(x, device) for x in obj)
+
+        if isinstance(obj, dict):
+            return {k: move_obj(v, device) for k, v in obj.items()}
+
+        return obj
+
+    def contains_torch_obj(obj):
+        if isinstance(obj, torch.nn.Module) or torch.is_tensor(obj):
+            return True
+
+        if isinstance(obj, (list, tuple)):
+            return any(contains_torch_obj(x) for x in obj)
+
+        if isinstance(obj, dict):
+            return any(contains_torch_obj(v) for v in obj.values())
+
+        return False
+
+    if isinstance(vae, torch.nn.Module):
+        vae.to(vae_device)
+        moved.append(type(vae).__name__)
+    else:
+        # Wan2_1_VAE-style wrapper: move modules/tensors stored on the wrapper,
+        # including nested containers such as self.scale = [mean, std].
+        for name, value in vars(vae).items():
+            if contains_torch_obj(value):
+                setattr(vae, name, move_obj(value, vae_device))
+                moved.append(name)
+
+    if moved:
+        print(f"[lingbot] moved VAE internals to {vae_device}: {', '.join(moved)}", flush=True)
+    else:
+        print(
+            f"[lingbot] WARNING: VAE object has no direct torch modules/tensors to move: "
+            f"{type(vae).__name__}",
+            flush=True,
+        )
+
+    orig_encode = vae.encode
+    orig_decode = vae.decode
+
+    def encode_on_vae_device(xs, *args, **kwargs):
+        xs = move_obj(xs, vae_device)
+        args = move_obj(args, vae_device)
+        kwargs = move_obj(kwargs, vae_device)
+
+        with torch.cuda.device(vae_device):
+            ys = orig_encode(xs, *args, **kwargs)
+
+        # streaming_fast expects latents back on the DiT / streaming device.
+        return move_obj(ys, dit_device)
+
+    def decode_on_vae_device(zs, *args, **kwargs):
+        zs = move_obj(zs, vae_device)
+        args = move_obj(args, vae_device)
+        kwargs = move_obj(kwargs, vae_device)
+
+        with torch.cuda.device(vae_device):
+            frames = orig_decode(zs, *args, **kwargs)
+
+        # Keep downstream behavior compatible with streaming_fast.
+        return move_obj(frames, dit_device)
+
+    vae.encode = encode_on_vae_device
+    vae.decode = decode_on_vae_device
+
+    print(
+        f"[lingbot] patched VAE encode/decode device bridge: "
+        f"dit={dit_device} <-> vae={vae_device}",
+        flush=True,
+    )
+
+    return vae_device
+
 
 @app.on_event("startup")
 def load_pipe():
@@ -216,6 +331,7 @@ def load_pipe():
         print(f"[lingbot] loading pre-quantized DiT from subfolder '{FAST_SUBFOLDER}'", flush=True)
     else:
         _install_quant_patch()                       # must run BEFORE weights load
+
     PIPE = WanI2VFastStreaming(
         config=cfg,
         checkpoint_dir=CKPT_DIR,        # 'cam' is auto-detected from this path
@@ -226,11 +342,14 @@ def load_pipe():
         local_attn_size=LOCAL_ATTN,
         sink_size=SINK,
     )
+
+    _move_pipe_vae_to_device(PIPE, VAE_DEVICE_ID)
+
     # Prewarm at the streaming shape so the first frame isn't taxed ~6s.
     dummy = Image.new("RGB", (832, 480))
     PIPE.prewarm(torch.from_numpy(np.array(dummy)).permute(2, 0, 1),
                  max_area=MAX_AREA, frame_num=(CHUNK - 1) * 4 + 1, chunk_size=CHUNK)
-    print(f"[lingbot] ready: device=cuda:{DEVICE_ID} t5_cpu={T5_CPU} "
+    print(f"[lingbot] ready: device=cuda:{DEVICE_ID} vae=cuda:{VAE_DEVICE_ID} t5_cpu={T5_CPU} "
           f"window={LOCAL_ATTN}f (~{LOCAL_ATTN*4/FPS:.1f}s, ~{LOCAL_ATTN*1.28:.0f}GB KV) "
           f"chunk={CHUNK} shift={SHIFT} quant={QUANT or 'bf16'}", flush=True)
 
