@@ -80,7 +80,11 @@ MAX_AREA      = int(eval(os.environ.get("LW_MAX_AREA", "480*832")))  # noqa: S30
 QUANT         = os.environ.get("LW_QUANT", "").lower()
 FAST_SUBFOLDER = os.environ.get("LW_FAST_SUBFOLDER", "lingbot_world_fast")
 PREQUANT      = os.environ.get("LW_PREQUANTIZED", "0") == "1"
+
 FPS           = 16
+PLAY_FPS = float(os.environ.get("LW_PLAY_FPS", "4"))
+# Max queued decoded frames. Prevents runaway RAM use if generation outruns playback.
+FRAME_QUEUE_MAX = int(os.environ.get("LW_FRAME_QUEUE_MAX", "64"))
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])

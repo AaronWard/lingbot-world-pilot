@@ -41,6 +41,8 @@ python server/main.py        # serves ws://0.0.0.0:8000/ws
 
 ### Quantize the model:
 
+
+to avoid quantizing on each run, pre quanitize it beforehand
 ```sh
 LW_REPO=$PWD/lingbot-world 
 LW_CKPT_DIR=/mnt/data4tb/lingbot-world-base-cam 
