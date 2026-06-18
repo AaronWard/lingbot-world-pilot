@@ -154,31 +154,46 @@ def default_intrinsics(width=832, height=480, fov_deg=60.0):
 # --------------------------------------------------------------------------- #
 def _install_quant_patch():
     """Make WanModelFast load already-quantized so the full bf16 (~28GB) DiT is
-    never materialized on the GPU. NF4 leaves ~7GB for the DiT, which is what
-    makes room for the KV cache on a single 32GB card.
+    never materialized on the GPU. NF4 -> ~7GB (slow matmul, max window).
+    FP8 -> ~14GB (Blackwell-native fp8 tensor cores: faster + cleaner than NF4,
+    slightly smaller window). The full bf16 is loaded shard-by-shard and
+    quantized incrementally, so peak GPU stays ~17GB during load.
     """
+    from wan.modules.model_fast import WanModelFast
+
     if QUANT == "nf4":
         from diffusers import BitsAndBytesConfig
-        from wan.modules.model_fast import WanModelFast
         qcfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-        _orig = WanModelFast.from_pretrained  # bound classmethod (cls already bound)
-
-        def _patched(*args, **kwargs):
-            kwargs.setdefault("quantization_config", qcfg)
-            return _orig(*args, **kwargs)
-
-        WanModelFast.from_pretrained = staticmethod(_patched)
-        print("[lingbot] NF4 quantization armed (load-time)", flush=True)
+        device_map = None
+        label = "NF4"
     elif QUANT == "fp8":
-        raise NotImplementedError(
-            "fp8 path not wired; use LW_QUANT=nf4 (tested) or leave empty for bf16.")
-    elif QUANT not in ("", "bf16"):
+        from diffusers import TorchAoConfig
+        # float8dq = dynamic-activation + fp8 weight -> uses the fp8 tensor cores
+        # (fast). If this errors on your torchao build, fall back to "float8wo"
+        # (weight-only fp8: same memory, less speed, very robust).
+        qcfg = TorchAoConfig(os.environ.get("LW_FP8_QUANT", "float8dq_e4m3"))
+        device_map = {"": DEVICE_ID}     # torchao quantizes on the target GPU
+        label = "FP8"
+    elif QUANT in ("", "bf16"):
+        return
+    else:
         raise ValueError(f"unknown LW_QUANT={QUANT!r}")
+
+    _orig = WanModelFast.from_pretrained  # bound classmethod (cls already bound)
+
+    def _patched(*args, **kwargs):
+        kwargs.setdefault("quantization_config", qcfg)
+        if device_map is not None:
+            kwargs.setdefault("device_map", device_map)
+        return _orig(*args, **kwargs)
+
+    WanModelFast.from_pretrained = staticmethod(_patched)
+    print(f"[lingbot] {label} quantization armed (load-time)", flush=True)
 
 
 @app.on_event("startup")
