@@ -17,24 +17,37 @@
 
 3. In a separate terminal, run the python websocket server
 ```bash
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=1
+cd /home/aw/Documents/github/_homelab/lingbot-world-pilot
+pip install -r lingbot-world/requirements.txt fastapi uvicorn pillow
+pip install flash-attn --no-build-isolation
 
-export LINGBOT_MODEL_REPO=/home/aw/Documents/models/lingbot
-export LINGBOT_MAX_SESSIONS=1
-export LINGBOT_TARGET_FPS=2
-export LINGBOT_CHUNK_FRAMES=1
-export LINGBOT_LOW_WATER_FRAMES=1
-export LINGBOT_HIGH_WATER_FRAMES=3
-export LINGBOT_KEEP_MODELS_ON_GPU=0
-export LINGBOT_STOP_ON_DISCONNECT=1
-export LINGBOT_CORS_ORIGINS=*
-export LINGBOT_T5_CPU=1
-export LINGBOT_PRELOAD_ON_STARTUP=0
-export LINGBOT_FORCE_RESOLUTION=480p
-
-python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+export LW_REPO=$PWD/lingbot-world
+export LW_CKPT_DIR=/mnt/data4tb/lingbot-world-base-cam
+export LW_DEVICE_ID=0        # the 5090
+export LW_T5_CPU=1           # 4060 (8GB) can't hold umt5-xxl; CPU is fine — T5 runs once/session then caches
+export LW_LOCAL_ATTN=12      # ~3s window, ~15GB KV
+export LW_SINK=1
+export LW_CHUNK=3
+export LW_SHIFT=3.0          # 480p
+export LW_QUANT=nf4          # required to fit; wire your bnb swap into _maybe_quantize first
+python server/main.py        # serves ws://0.0.0.0:8000/ws
 ```
 
 
 ![splash](./render.png)
+
+
+---
+
+### Quantize the model:
+
+```sh
+LW_REPO=$PWD/lingbot-world 
+LW_CKPT_DIR=/mnt/data4tb/lingbot-world-base-cam 
+LW_DEVICE_ID=0
+
+python quantize_fast_nf4.py
+
+export LW_FAST_SUBFOLDER=lingbot_world_fast_nf4
+export LW_PREQUANTIZED=1
+```
