@@ -73,7 +73,7 @@ T5_CPU       = os.environ.get("LW_T5_CPU", "1") == "1"
 LOCAL_ATTN   = int(os.environ.get("LW_LOCAL_ATTN", "8"))  # ~2s window, ~10GB KV
 SINK         = int(os.environ.get("LW_SINK", "1"))
 CHUNK        = int(os.environ.get("LW_CHUNK", "3"))
-SHIFT        = float(os.environ.get("LW_SHIFT", "3.0"))
+SHIFT        = float(os.environ.get("LW_SHIFT", "10.0"))  # i2v-A14B config default; Fast was distilled on this
 MAX_AREA     = int(eval(os.environ.get("LW_MAX_AREA", "480*832")))  # noqa: S307 (trusted env)
 QUANT        = os.environ.get("LW_QUANT", "").lower()
 FAST_SUBFOLDER = os.environ.get("LW_FAST_SUBFOLDER", "lingbot_world_fast")
@@ -94,18 +94,21 @@ RES_TO_AREA = {"480p": 480 * 832, "720p": 720 * 1280}
 # Camera: integrate WASD + mouse into OpenCV camera-to-world poses
 # --------------------------------------------------------------------------- #
 class Camera:
-    """Minimal FPS-style camera in OpenCV convention (x right, y down, z fwd).
+    """FPS-style camera in OpenCV convention (x right, y down, z fwd).
 
-    Produces one absolute c2w matrix per *latent* frame. CALIBRATE move_speed /
-    look_sensitivity to taste; these set how far the model is asked to move per
-    second of input.
+    Velocity-based: input messages update `keys` and accumulate mouse delta
+    instantly; the generation loop calls advance() once per *latent frame* to
+    integrate motion at its own pace. This decouples the (fast) input rate from
+    the (slow) generation rate, so there is no backlog and held keys take effect
+    on the very next chunk. Tune move_speed / look_sensitivity via env.
     """
-    def __init__(self, move_speed=1.0, look_sensitivity=0.0025):
+    def __init__(self, move_speed=0.3, look_sensitivity=0.0035):
         self.pos = np.zeros(3, dtype=np.float64)
-        self.yaw = 0.0     # radians, around world-up (y)
+        self.yaw = 0.0
         self.pitch = 0.0
         self.move_speed = move_speed
         self.look_sensitivity = look_sensitivity
+        self.keys: set = set()
 
     def _rot(self):
         cy, sy = np.cos(self.yaw), np.sin(self.yaw)
@@ -115,26 +118,30 @@ class Camera:
         return Ry @ Rx
 
     def _c2w(self):
-        R = self._rot()
         T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R
+        T[:3, :3] = self._rot()
         T[:3, 3] = self.pos
         return T
 
-    def integrate(self, keys, dx, dy, dt):
-        """Advance the camera by one input sample and return its pose."""
-        self.yaw += dx * self.look_sensitivity
-        self.pitch = float(np.clip(self.pitch + dy * self.look_sensitivity, -1.3, 1.3))
+    def advance(self, dyaw: float, dpitch: float) -> np.ndarray:
+        """Advance one latent frame: apply look delta + translate by held keys.
+        Translation is per-frame (already scaled by move_speed), so with
+        normalize_trans=False downstream the motion is proportional to input."""
+        self.yaw += dyaw
+        self.pitch = float(np.clip(self.pitch + dpitch, -1.3, 1.3))
         R = self._rot()
         fwd = R @ np.array([0, 0, 1.0])
         right = R @ np.array([1.0, 0, 0])
-        step = self.move_speed * dt
-        k = set(keys or [])
-        if "w" in k: self.pos += fwd * step
-        if "s" in k: self.pos -= fwd * step
-        if "d" in k: self.pos += right * step
-        if "a" in k: self.pos -= right * step
+        s = self.move_speed
+        if "w" in self.keys: self.pos += fwd * s
+        if "s" in self.keys: self.pos -= fwd * s
+        if "d" in self.keys: self.pos += right * s
+        if "a" in self.keys: self.pos -= right * s
         return self._c2w()
+
+
+MOVE_SPEED = float(os.environ.get("LW_MOVE_SPEED", "0.3"))
+LOOK_SENS  = float(os.environ.get("LW_LOOK_SENS", "0.0035"))
 
 
 def default_intrinsics(width=832, height=480, fov_deg=60.0):
@@ -245,11 +252,36 @@ async def create_session(
 @app.websocket("/ws")
 async def ws(sock: WebSocket):
     await sock.accept()
-    cam = Camera()
+    import json
+    cam = Camera(move_speed=MOVE_SPEED, look_sensitivity=LOOK_SENS)
     K = default_intrinsics()
-    samples: list[tuple] = []     # pending (keys, dx, dy, dt)
-    frame_idx = 0
-    started = False
+    mouse = {"dx": 0.0, "dy": 0.0}
+    state = {"running": False, "frame_idx": 0}
+    gen_task = None
+
+    async def gen_loop():
+        """Generate continuously: each iteration advances the camera by held
+        input over CHUNK latent frames, runs one step, streams the frames.
+        Decoupled from input arrival, so WASD affects the next chunk immediately
+        and there is no backlog."""
+        try:
+            while state["running"]:
+                dx = mouse["dx"]; dy = mouse["dy"]
+                mouse["dx"] = 0.0; mouse["dy"] = 0.0
+                dyaw = (dx * cam.look_sensitivity) / CHUNK
+                dpitch = (dy * cam.look_sensitivity) / CHUNK
+                poses = np.stack([cam.advance(dyaw, dpitch) for _ in range(CHUNK)], axis=0)
+                frames = await asyncio.to_thread(PIPE.step, poses, K)
+                for f in frames:
+                    await sock.send_bytes(_pack_frame(state["frame_idx"], f))
+                    state["frame_idx"] += 1
+        except Exception as e:               # surface, don't die silently
+            state["running"] = False
+            try:
+                await sock.send_text(json.dumps({"type": "error", "message": str(e)}))
+            except Exception:
+                pass
+            print(f"[lingbot] gen_loop error: {e!r}", flush=True)
 
     try:
         while True:
@@ -258,7 +290,6 @@ async def ws(sock: WebSocket):
                 break
             if "text" not in msg or msg["text"] is None:
                 continue
-            import json
             data = json.loads(msg["text"])
             kind = data.get("type")
 
@@ -270,68 +301,46 @@ async def ws(sock: WebSocket):
                 sid = data.get("session_id")
                 if sid and sid in SESSIONS:
                     sess = SESSIONS.pop(sid)
-                    img = sess["image"]
-                    prompt = sess["prompt"]
-                    sess_area = sess["max_area"]
+                    img = sess["image"]; prompt = sess["prompt"]; sess_area = sess["max_area"]
                 elif data.get("image"):
                     img = Image.open(io.BytesIO(base64.b64decode(data["image"]))).convert("RGB")
-                    prompt = data.get("prompt", "")
-                    sess_area = MAX_AREA
+                    prompt = data.get("prompt", ""); sess_area = MAX_AREA
                 else:
                     await sock.send_text('{"type":"error","message":"no session_id or image"}')
                     PIPE_LOCK.release()
                     continue
                 seed = int(data.get("seed", -1))
-                # start_session is blocking GPU work -> run off the event loop.
                 await asyncio.to_thread(
                     PIPE.start_session, img, prompt,
-                    max_area=sess_area, chunk_size=CHUNK, shift=SHIFT, seed=seed)
+                    max_area=sess_area, chunk_size=CHUNK, shift=SHIFT, seed=seed,
+                    normalize_trans=False)        # raw, proportional camera motion
                 h = PIPE._s["h"]; w = PIPE._s["w"]
-                started = True
-                samples.clear()
-                frame_idx = 0
+                state["running"] = True
+                state["frame_idx"] = 0
                 await sock.send_text(f'{{"type":"ready","width":{w},"height":{h},"fps":{FPS}}}')
+                gen_task = asyncio.create_task(gen_loop())
 
-            elif kind == "input" and started:
-                samples.append((data.get("keys", []),
-                                float(data.get("dx", 0.0)),
-                                float(data.get("dy", 0.0)),
-                                float(data.get("dt", 1.0 / FPS))))
-                # One chunk == CHUNK latent frames == CHUNK*4 pixel frames of input.
-                if len(samples) >= CHUNK * 4:
-                    poses = _samples_to_chunk_poses(cam, samples, CHUNK)
-                    samples.clear()
-                    frames = await asyncio.to_thread(PIPE.step, poses, K)
-                    for f in frames:
-                        await sock.send_bytes(_pack_frame(frame_idx, f))
-                        frame_idx += 1
+            elif kind == "input" and state["running"]:
+                cam.keys = set(data.get("keys", []))      # live: takes effect next chunk
+                mouse["dx"] += float(data.get("dx", 0.0))
+                mouse["dy"] += float(data.get("dy", 0.0))
 
             elif kind == "stop":
                 break
     except WebSocketDisconnect:
         pass
     finally:
-        if started:
+        state["running"] = False
+        if gen_task is not None:
+            gen_task.cancel()
+            try:
+                await gen_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if PIPE.__class__ and getattr(PIPE, "_s", None) is not None:
             await asyncio.to_thread(PIPE.end_session)
         if PIPE_LOCK.locked():
             PIPE_LOCK.release()
-
-
-def _samples_to_chunk_poses(cam: Camera, samples, chunk_size) -> np.ndarray:
-    """Collapse CHUNK*4 input samples into CHUNK latent-frame poses.
-
-    Each latent frame summarizes 4 consecutive input samples; we integrate all
-    of them and snapshot the camera pose at each latent-frame boundary.
-    """
-    poses = []
-    per = max(1, len(samples) // chunk_size)
-    for i in range(chunk_size):
-        group = samples[i * per:(i + 1) * per] or samples[-1:]
-        pose = cam._c2w()
-        for (keys, dx, dy, dt) in group:
-            pose = cam.integrate(keys, dx, dy, dt)
-        poses.append(pose)
-    return np.stack(poses, axis=0)      # [chunk_size, 4, 4]
 
 
 if __name__ == "__main__":
