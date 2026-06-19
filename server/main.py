@@ -82,6 +82,7 @@ FAST_SUBFOLDER = os.environ.get("LW_FAST_SUBFOLDER", "lingbot_world_fast")
 PREQUANT      = os.environ.get("LW_PREQUANTIZED", "0") == "1"
 
 FPS           = 16
+
 PLAY_FPS = float(os.environ.get("LW_PLAY_FPS", "4"))
 # Max queued decoded frames. Prevents runaway RAM use if generation outruns playback.
 FRAME_QUEUE_MAX = int(os.environ.get("LW_FRAME_QUEUE_MAX", "64"))
@@ -407,28 +408,109 @@ async def ws(sock: WebSocket):
     gen_task = None
 
     async def gen_loop():
-        """Generate continuously: each iteration advances the camera by held
-        input over CHUNK latent frames, runs one step, streams the frames.
-        Decoupled from input arrival, so WASD affects the next chunk immediately
-        and there is no backlog."""
-        try:
+        """Generate chunks in one task and send frames at a steady cadence in another.
+
+        This fixes burstiness by decoupling:
+        - expensive chunk generation: PIPE.step(...)
+        - websocket playback: sock.send_bytes(...)
+
+        The producer still generates whole chunks, because PIPE.step is chunk-based.
+        The consumer smooths those decoded frames into steady playback.
+        """
+        frame_q: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=FRAME_QUEUE_MAX)
+
+        async def producer():
             while state["running"]:
-                dx = mouse["dx"]; dy = mouse["dy"]
-                mouse["dx"] = 0.0; mouse["dy"] = 0.0
+                # Snapshot accumulated mouse movement for the next generated chunk.
+                # This runs on the event loop thread, so no lock is needed.
+                dx = mouse["dx"]
+                dy = mouse["dy"]
+                mouse["dx"] = 0.0
+                mouse["dy"] = 0.0
+
                 dyaw = (dx * cam.look_sensitivity) / CHUNK
                 dpitch = (dy * cam.look_sensitivity) / CHUNK
-                poses = np.stack([cam.advance(dyaw, dpitch) for _ in range(CHUNK)], axis=0)
+
+                poses = np.stack(
+                    [cam.advance(dyaw, dpitch) for _ in range(CHUNK)],
+                    axis=0,
+                )
+
+                t0 = time.perf_counter()
                 frames = await asyncio.to_thread(PIPE.step, poses, K)
+                dt = time.perf_counter() - t0
+
+                sustainable_fps = len(frames) / max(dt, 1e-6)
+                print(
+                    f"[lingbot] chunk: {dt:.2f}s for {len(frames)} frames "
+                    f"-> {sustainable_fps:.2f} fps sustainable "
+                    f"(queue={frame_q.qsize()}/{FRAME_QUEUE_MAX})",
+                    flush=True,
+                )
+
+                # Queue frames for steady playback.
+                # If the queue is full, this applies backpressure instead of allowing
+                # unlimited memory growth.
                 for f in frames:
-                    await sock.send_bytes(_pack_frame(state["frame_idx"], f))
-                    state["frame_idx"] += 1
-        except Exception as e:               # surface, don't die silently
+                    if not state["running"]:
+                        break
+                    await frame_q.put(f)
+
+        async def consumer():
+            target_fps = max(0.1, PLAY_FPS)
+            interval = 1.0 / target_fps
+            next_send_at = time.perf_counter()
+
+            while state["running"]:
+                # Wait for a frame. This avoids busy-spinning while generation is busy.
+                f = await frame_q.get()
+
+                # Pace output. This is the actual anti-burst part.
+                now = time.perf_counter()
+                delay = next_send_at - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                await sock.send_bytes(_pack_frame(state["frame_idx"], f))
+                state["frame_idx"] += 1
+
+                # Do not "catch up" by bursting if send_bytes or the event loop was late.
+                next_send_at = max(next_send_at + interval, time.perf_counter())
+
+        prod_task = asyncio.create_task(producer())
+        cons_task = asyncio.create_task(consumer())
+
+        try:
+            done, pending = await asyncio.wait(
+                {prod_task, cons_task},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
             state["running"] = False
             try:
                 await sock.send_text(json.dumps({"type": "error", "message": str(e)}))
             except Exception:
                 pass
             print(f"[lingbot] gen_loop error: {e!r}", flush=True)
+
+        finally:
+            state["running"] = False
+
+            for task in (prod_task, cons_task):
+                task.cancel()
+
+            await asyncio.gather(prod_task, cons_task, return_exceptions=True)
 
     try:
         while True:
@@ -464,7 +546,10 @@ async def ws(sock: WebSocket):
                 h = PIPE._s["h"]; w = PIPE._s["w"]
                 state["running"] = True
                 state["frame_idx"] = 0
-                await sock.send_text(f'{{"type":"ready","width":{w},"height":{h},"fps":{FPS}}}')
+                # await sock.send_text(f'{{"type":"ready","width":{w},"height":{h},"fps":{FPS}}}')
+                await sock.send_text(
+                    f'{{"type":"ready","width":{w},"height":{h},"fps":{int(round(PLAY_FPS))}}}'
+                )
                 gen_task = asyncio.create_task(gen_loop())
 
             elif kind == "input" and state["running"]:
